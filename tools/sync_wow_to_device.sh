@@ -40,16 +40,37 @@ while IFS= read -r f; do
     echo "pushed $f"
 done < "$WORK/push.txt"
 
+PRODUCT="$(python3 - "$SRC_ROOT/.build.info" <<'PY'
+import sys
+path = sys.argv[1]
+lines = open(path).read().splitlines()
+header = [h.split("!")[0] for h in lines[0].split("|")]
+for line in lines[1:]:
+    if not line.strip():
+        continue
+    row = dict(zip(header, line.split("|")))
+    print(row.get("Product", ""))
+    break
+PY
+)"
+case "$PRODUCT" in
+    wowf) FLAVOR_DIR="_forever_"; EXE_NAME="Wow-arm64.exe"; SCRIPT_EXE="Wow-ARM64.exe" ;;
+    *) FLAVOR_DIR="_classic_beta_"; EXE_NAME="WowB-ARM64.exe"; SCRIPT_EXE="WowB-ARM64.exe" ;;
+esac
+
 local_build="$(cat "$SRC_ROOT/.build.info")"
 device_build="$(adb shell cat "'$DST_ROOT/.build.info'" 2>/dev/null | tr -d '\r' || true)"
 adb push "$SRC_ROOT/.build.info" "$DST_ROOT/.build.info" > /dev/null
-adb push "$SRC_ROOT/_classic_beta_/.flavor.info" "$DST_ROOT/_classic_beta_/.flavor.info" > /dev/null
+adb shell "mkdir -p '$DST_ROOT/$FLAVOR_DIR'" >/dev/null
+adb push "$SRC_ROOT/$FLAVOR_DIR/.flavor.info" "$DST_ROOT/$FLAVOR_DIR/.flavor.info" > /dev/null
 
 if [ "$local_build" != "$device_build" ] || [ "${FORCE_EXE:-0}" = "1" ]; then
-    WOW_DIR="$SRC_ROOT" python3 "$REPO_DIR/tools/download_wow_arm64.py" "$WORK/exe"
-    adb push "$WORK/exe/WowB-ARM64.exe" "$DST_ROOT/_classic_beta_/WowB-ARM64.exe" > /dev/null
+    WOW_DIR="$SRC_ROOT" WOW_PRODUCT="$PRODUCT" python3 "$REPO_DIR/tools/download_wow_arm64.py" "$WORK/exe"
+    SRC_EXE="$SCRIPT_EXE"
+    [ -f "$WORK/exe/Wow-ARM64.exe" ] && SRC_EXE="Wow-ARM64.exe"
+    adb push "$WORK/exe/$SRC_EXE" "$DST_ROOT/$FLAVOR_DIR/$EXE_NAME" > /dev/null
 else
-    echo "Build unchanged, keeping WowB-ARM64.exe"
+    echo "Build unchanged, keeping $EXE_NAME"
 fi
 
 list_device > "$WORK/device.txt"

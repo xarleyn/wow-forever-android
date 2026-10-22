@@ -14,15 +14,38 @@ import java.util.zip.Inflater
 import timber.log.Timber
 
 object WowClientDownloader {
+    // Backwards-compatible defaults for the original Forever Beta profile.
     const val FLAVOR_DIR = "_classic_beta_"
     const val EXE_NAME = "WowB-ARM64.exe"
     const val TARGET_PRODUCT = "wow_classic_beta"
     const val BUILD_INFO = ".build.info"
     private const val PLATFORM_ARCH = "arm64"
     private const val EXCLUDED_ARCH = "x86_64"
-    private const val PATCH_URL = "http://us.patch.battle.net:1119/$TARGET_PRODUCT"
     private const val DEFAULT_CDN_PATH = "tpr/wow"
     private val DEFAULT_CDN_HOSTS = listOf("level3.blizzard.com", "us.cdn.blizzard.com")
+
+    @Volatile
+    var selectedProductId: String? = null
+
+    fun profileOf(productId: String?): WoWProductProfile? = WoWProducts.find(productId)
+
+    fun activeProfile(buildInfo: File): WoWProductProfile? = profileOf(runCatching { activeBuild(buildInfo)["Product"] }.getOrNull())
+
+    /**
+     * Resolves the ARM64 client binary that is actually present on disk.
+     * Blizzard ships the Stress Test binary as `Wow-ARM64.exe` in the install
+     * manifest while the product config advertises `Wow-arm64.exe`; Android's
+     * filesystem is case sensitive, so both spellings are accepted.
+     */
+    fun resolveExecutable(gameRoot: File, profile: WoWProductProfile): File? =
+        profile.executableCandidates
+            .map { File(gameRoot, "${profile.flavorDir}/$it") }
+            .firstOrNull { it.isFile }
+
+    fun profileForGameRoot(gameRoot: File): WoWProductProfile {
+        val product = runCatching { readBuildInfo(File(gameRoot, BUILD_INFO))?.get("Product") }.getOrNull()
+        return profileOf(product) ?: WoWProducts.BETA
+    }
 
     private val patchHttp by lazy {
         Net.http.newBuilder()
@@ -36,6 +59,8 @@ object WowClientDownloader {
         val localVersion: String,
         val remoteVersion: String,
         val isOutdated: Boolean,
+        val productId: String = "",
+        val profile: WoWProductProfile? = null,
         val remoteBuildConfig: String = "",
         val remoteCdnConfig: String = "",
         val remoteCdnHosts: List<String> = emptyList(),
@@ -50,9 +75,10 @@ object WowClientDownloader {
             Timber.w(it, "checkVersion: no readable $BUILD_INFO in $gameRoot")
             return null
         }
-        val product = row["Product"]?.takeIf { it.isNotBlank() } ?: TARGET_PRODUCT
-        if (product != TARGET_PRODUCT) {
-            Timber.w("checkVersion: wrong product '$product', expected '$TARGET_PRODUCT'")
+        val product = row["Product"]?.takeIf { it.isNotBlank() }
+        val profile = profileOf(product)
+        if (profile == null) {
+            Timber.w("checkVersion: unsupported product '${product.orEmpty()}', expected one of ${WoWProducts.supported.map { it.productId }}")
             return null
         }
         val localVersion = row["Version"] ?: run {
@@ -64,7 +90,8 @@ object WowClientDownloader {
             return null
         }
 
-        val versions = runCatching { fetchText("$PATCH_URL/versions") }.getOrElse {
+        val patchUrl = "http://us.patch.battle.net:1119/${profile.productId}"
+        val versions = runCatching { fetchText("$patchUrl/versions") }.getOrElse {
             Timber.w(it, "checkVersion: http call failed")
             return null
         } ?: run {
@@ -83,15 +110,17 @@ object WowClientDownloader {
             }
         val remoteBuildKey = remoteRow["BuildConfig"].orEmpty()
 
-        val cdns = runCatching { fetchText("$PATCH_URL/cdns") }.getOrNull()?.let(::parsePsv).orEmpty()
+        val cdns = runCatching { fetchText("$patchUrl/cdns") }.getOrNull()?.let(::parsePsv).orEmpty()
         val cdnsRow = cdns.firstOrNull { it["Name"] == "us" } ?: cdns.firstOrNull()
 
         val isOutdated = localVersion != remoteVersion || (remoteBuildKey.isNotBlank() && localBuildKey != remoteBuildKey)
-        Timber.i("checkVersion: localVersion=$localVersion, remoteVersion=$remoteVersion, isOutdated=$isOutdated")
+        Timber.i("checkVersion: product=${profile.productId} localVersion=$localVersion, remoteVersion=$remoteVersion, isOutdated=$isOutdated")
         return VersionCheckResult(
             localVersion = localVersion,
             remoteVersion = remoteVersion,
             isOutdated = isOutdated,
+            productId = profile.productId,
+            profile = profile,
             remoteBuildConfig = remoteBuildKey,
             remoteCdnConfig = remoteRow["CDNConfig"].orEmpty(),
             remoteCdnHosts = (cdnsRow?.get("Hosts") ?: row["CDN Hosts"])?.let(::splitHosts) ?: DEFAULT_CDN_HOSTS,
@@ -100,6 +129,7 @@ object WowClientDownloader {
     }
 
     fun updateGame(gameRoot: File, target: VersionCheckResult, onStatus: (String) -> Unit) {
+        val profile = target.profile ?: profileOf(target.productId) ?: profileForGameRoot(gameRoot)
         val cdn = Cdn(
             hosts = target.remoteCdnHosts.ifEmpty { DEFAULT_CDN_HOSTS },
             path = target.remoteCdnPath.ifEmpty { DEFAULT_CDN_PATH },
@@ -118,16 +148,19 @@ object WowClientDownloader {
             buildConfig = parseConfig(String(buildConfigRaw)),
             archives = lazy { cdnConfig?.let { ArchiveLocator(cdn, gameRoot, it.getValue("archives")) } },
             onStatus = onStatus,
+            flavorDir = profile.flavorDir,
+            executableNames = profile.executableCandidates,
         )
         cdnConfig?.let { syncIndices(gameRoot, cdn, it, onStatus) }
 
         onStatus("Updating build information...")
-        updateBuildInfo(gameRoot, target)
+        updateBuildInfo(gameRoot, target, profile.productId)
     }
 
     fun download(gameRoot: File, onStatus: (String) -> Unit) {
         val row = activeBuild(File(gameRoot, BUILD_INFO))
-        check(row["Product"] == TARGET_PRODUCT) { "Incompatible game product: ${row["Product"]}. Expected $TARGET_PRODUCT." }
+        val profile = profileOf(row["Product"])
+            ?: throw IllegalStateException("Incompatible game product: ${row["Product"]}. Expected one of ${WoWProducts.supported.map { it.productId }}.")
         val latest = checkVersion(gameRoot)
         if (latest != null && latest.remoteBuildConfig.isNotBlank()) return updateGame(gameRoot, latest, onStatus)
 
@@ -141,6 +174,8 @@ object WowClientDownloader {
                 ArchiveLocator(cdn, gameRoot, parseConfig(String(cdn.require("config", row.getValue("CDN Key")))).getValue("archives"))
             },
             onStatus = onStatus,
+            flavorDir = profile.flavorDir,
+            executableNames = profile.executableCandidates,
         )
     }
 
@@ -150,12 +185,27 @@ object WowClientDownloader {
         buildConfig: Map<String, List<String>>,
         archives: Lazy<ArchiveLocator?>,
         onStatus: (String) -> Unit,
+        flavorDir: String = FLAVOR_DIR,
+        executableNames: List<String> = emptyList(),
     ) {
         val files = parseInstall(blteDecode(cdn.require("data", buildConfig.getValue("install")[1]))).filter { it.isClientBinary() }
         check(files.isNotEmpty()) { "No Windows ARM64 client files in this build" }
 
-        val clientDir = File(gameRoot, FLAVOR_DIR)
-        val pending = files.filter { md5Hex(File(clientDir, it.relativePath)) != it.ckey }
+        val clientDir = File(gameRoot, flavorDir)
+        // Blizzard's product config advertises `Wow-arm64.exe` while the install manifest ships
+        // `Wow-ARM64.exe`. Files keep the manifest name (that is what a real install looks like)
+        // and the launcher resolves the executable case-insensitively on disk.
+        fun isClientExe(entry: InstallEntry) = executableNames.any { entry.name.equals(it, ignoreCase = true) }
+        // A client already present under any accepted spelling counts as up to date.
+        fun isUpToDate(entry: InstallEntry): Boolean {
+            val candidates = if (isClientExe(entry)) {
+                executableNames.map { File(clientDir, it) } + File(clientDir, entry.relativePath)
+            } else {
+                listOf(File(clientDir, entry.relativePath))
+            }
+            return candidates.any { md5Hex(it) == entry.ckey }
+        }
+        val pending = files.filter { entry -> !isUpToDate(entry) }
         if (pending.isEmpty()) return
 
         onStatus("Looking up client files...")
@@ -199,7 +249,7 @@ object WowClientDownloader {
         }
     }
 
-    private fun updateBuildInfo(gameRoot: File, target: VersionCheckResult) {
+    private fun updateBuildInfo(gameRoot: File, target: VersionCheckResult, productId: String = target.productId.ifBlank { TARGET_PRODUCT }) {
         val buildInfo = File(gameRoot, BUILD_INFO)
         if (!buildInfo.isFile) return
         val lines = buildInfo.readLines()
@@ -218,12 +268,30 @@ object WowClientDownloader {
         val updated = lines.mapIndexed { idx, line ->
             if (idx == 0 || line.isBlank()) return@mapIndexed line
             val cols = line.split("|").toMutableList()
-            val matchesProduct = productIdx < 0 || cols.getOrNull(productIdx) == TARGET_PRODUCT
+            val matchesProduct = productIdx < 0 || cols.getOrNull(productIdx) == productId
             val isActive = activeIdx < 0 || cols.getOrNull(activeIdx) == "1"
             if (matchesProduct && isActive) updates.forEach { (i, value) -> if (i in cols.indices) cols[i] = value }
             cols.joinToString("|")
         }
-        buildInfo.writeText(updated.joinToString("\n") + "\n")
+        val expectedColumns = header.size
+        if (updated.drop(1).filter { it.isNotBlank() }.any { it.split("|").size != expectedColumns }) {
+            Timber.w("updateBuildInfo: column count mismatch, aborting write")
+            return
+        }
+        val newText = updated.joinToString("\n") + "\n"
+        val backup = File(buildInfo.parentFile, "${buildInfo.name}.bak")
+        val temp = File(buildInfo.parentFile, "${buildInfo.name}.tmp")
+        try {
+            buildInfo.copyTo(backup, overwrite = true)
+            temp.writeText(newText)
+            if (buildInfo.exists()) buildInfo.delete()
+            check(temp.renameTo(buildInfo)) { "Could not replace $BUILD_INFO" }
+            backup.delete()
+        } catch (e: Exception) {
+            Timber.e(e, "updateBuildInfo failed, restoring backup")
+            runCatching { backup.copyTo(buildInfo, overwrite = true) }
+            temp.delete()
+        }
     }
 
     private data class InstallEntry(val name: String, val ckey: String, val tags: Set<String>) {
@@ -385,11 +453,32 @@ object WowClientDownloader {
     private fun activeBuild(buildInfo: File): Map<String, String> {
         check(buildInfo.isFile) { "Missing $BUILD_INFO in ${buildInfo.parent}" }
         val rows = parsePsv(buildInfo.readText())
-        return rows.firstOrNull { it["Product"] == TARGET_PRODUCT && it["Active"] == "1" }
-            ?: rows.firstOrNull { it["Product"] == TARGET_PRODUCT }
-            ?: rows.firstOrNull { it["Active"] == "1" }
-            ?: rows.firstOrNull()
-            ?: throw IllegalStateException("No build in $BUILD_INFO")
+        if (rows.isEmpty()) throw IllegalStateException("No build in $BUILD_INFO")
+
+        val supportedRows = rows.filter { WoWProducts.isSupported(it["Product"]) }
+        val preferredId = selectedProductId
+        val chosen = if (supportedRows.isNotEmpty()) {
+            // Explicit/saved profile choice wins when it is available.
+            if (preferredId != null) {
+                supportedRows.firstOrNull { it["Product"] == preferredId && it["Active"] == "1" }
+                    ?: supportedRows.firstOrNull { it["Product"] == preferredId }
+            } else null
+            // Then an active supported product, preferring supported order (STRESS before BETA).
+            ?: WoWProducts.supported.firstNotNullOfOrNull { profile ->
+                supportedRows.firstOrNull { it["Product"] == profile.productId && it["Active"] == "1" }
+            }
+            // Then any active supported row.
+            ?: supportedRows.firstOrNull { it["Active"] == "1" }
+            // Then first supported in supported order.
+            ?: WoWProducts.supported.firstNotNullOfOrNull { profile ->
+                supportedRows.firstOrNull { it["Product"] == profile.productId }
+            }
+            ?: supportedRows.first()
+        } else {
+            // No supported product: keep a diagnostic row instead of pretending success.
+            rows.firstOrNull { it["Active"] == "1" } ?: rows.first()
+        }
+        return chosen ?: throw IllegalStateException("No build in $BUILD_INFO")
     }
 
     private fun parsePsv(text: String): List<Map<String, String>> {

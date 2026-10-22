@@ -18,6 +18,7 @@ import com.winlator.widget.InputControlsView
 import com.winlator.widget.TouchpadView
 import com.winlator.widget.XServerRendererView
 import com.winlator.xenvironment.XEnvironment
+import app.gamenative.utils.LogBuffer
 import timber.log.Timber
 import dagger.hilt.android.HiltAndroidApp
 
@@ -41,6 +42,7 @@ class PluviaApp : Application() {
         } else {
             Timber.plant(ReleaseTree())
         }
+        Timber.plant(LogBuffer.Tree())
 
         CrashHandler.initialize(this)
         PrefManager.init(this)

@@ -32,7 +32,7 @@ Requirements:
 
 ### 1. Install the app
 
-Download `WoW-Forever.apk` from the [latest release](https://github.com/jaredgei/wow-forever-android/releases/latest) and install it on your device. The app's package name is `app.wowforever`, so it can sit alongside GameNative or Winlator.
+Download `WoW-Forever.apk` from the [latest release](https://github.com/xarleyn/wow-forever-android/releases/latest) and install it on your device. The app's package name is `app.wowforever`, so it can sit alongside GameNative or Winlator.
 
 ### 2. Copy your WoW game data to the device (one-time setup)
 
@@ -59,20 +59,48 @@ Transfer the files over to a `WoW Forever/` folder on your device. You can do th
 WOW_SRC="/Applications/World of Warcraft" tools/sync_wow_to_device.sh
 ```
 
+On Windows (PowerShell):
+
+```powershell
+$env:WOW_SRC="D:\Games\World of Warcraft"; .\tools\sync_wow_to_device.ps1
+```
+
+or, from cmd.exe:
+
+```cmd
+set "WOW_SRC=D:\Games\World of Warcraft" && tools\sync_wow_to_device.bat
+```
+
 ### 3. Play
 
 Open **WoW Forever**. Once your game files and Battle.net credentials are configured, the app automatically launches straight into the game. If credentials are not yet configured, the launcher stops at the setup screen so you can enter them before playing. The first launch downloads the ARM64 game client and installs the Windows environment, which takes a few minutes and needs an internet connection.
 
 - **Setup screen:** to access folder settings, forget credentials, check environment status, or view updates, hold **Start + Select + L2 + R2** (or tap the back button) during the loading splash to cancel boot and return to the setup screen.
-- The app creates a basic `WTF/Config.wtf` on first run and always sets `gxApi "D3D11"`, the renderer that works with DXVK.
+- The app creates a basic `WTF/Config.wtf` on first run and always sets `gxApi "D3D11"`, the renderer that works with DXVK. For `wowf`, it applies the selected account region as `portal "EU"`, `"US"`, `"KR"` or `"TW"` to existing configs too. `wow_classic_beta` retains its `portal "test"`. Other game settings and `WTF/Account/` files are preserved.
+- **Status / Logs tabs:** the setup screen has two tabs. **Status** shows the environment checklist; **Logs** shows the selected product's `Connection.log` tail (portal, token-use flag and server result), followed by the app log and process logcat. Account fields and authentication secrets are redacted before display, copying or sharing. Use **Refresh**, **Copy** (clipboard) and **Share** actions. The booting splash prints the last few log lines too, so a stalled boot is visible instead of silent.
 
 ### Controls and signing in
 
 - **Controller:** built-in handheld controllers work in-game. WoW's own gamepad mode handles the mapping.
 - **In-game menu:** press Back (the button or the back swipe gesture) to open the sidebar. It has **Keyboard**, on-screen controls, performance overlay and **Exit**.
 - **Keyboard:** the sidebar's **Keyboard** opens the Android keyboard. On dual-screen devices like the Thor it appears on the bottom screen. Symbols like `@` work, and so does pasting.
-- **Battle.net Auto-Login:** configure credentials directly on the launcher setup screen (**Configure Login** / **Update Login**). Credentials are saved encrypted on-device via Android Keystore. On boot, the launcher generates `_classic_beta_/login.txt`, which the WoW client automatically reads on startup to sign in natively without macro simulation or synthetic clicks. Use **Forget Saved Login** on the launcher setup screen to clear credentials and remove the login file.
+- **Battle.net accounts:** use the **BATTLE.NET ACCOUNT** card to add, select, edit or remove saved launch profiles. Each profile has a name, login and explicit WoW region (EU / US / KR / TW). The same Battle.net email can have separate EU and US profiles. Passwords are encrypted with Android Keystore. Existing saved logins are migrated and require region confirmation before auto-launch. On boot, the launcher generates `login.txt` in the selected product folder; removing or switching a profile removes stale login files. A profile name such as WoW1 is a local label; if the game offers several subscriptions, choose the subscription inside the game.
   - Authenticator codes still have to be entered by hand.
+
+---
+
+## Supported clients
+
+The launcher supports two Blizzard client identities and picks the right one from `.build.info`:
+
+| Product | Flavor folder | ARM64 client |
+| :--- | :--- | :--- |
+| `wow_classic_beta` (Forever Beta) | `_classic_beta_/` | `WowB-ARM64.exe` |
+| `wowf` (Forever Stress Test) | `_forever_/` | `Wow-arm64.exe` |
+
+The Stress Test install is recognized as-is: your existing `Data/` folder is reused, the CDN patch
+endpoint, the flavor directory, `.flavor.info`, `agentUID` and the launched executable all follow the
+selected product. See [docs/WOWF_COMPATIBILITY.md](docs/WOWF_COMPATIBILITY.md) for details.
 
 ---
 
@@ -95,7 +123,10 @@ Whenever Blizzard patches the game:
 
 | Symptom | Fix |
 | :--- | :--- |
+| *Failed to extract Proton or graphics components* | The bundled runtime archives are missing from the APK. Run `tools/fetch_components.sh` (or `.ps1`/`.bat` on Windows) and rebuild. |
+| *Incompatible game (wow / wow_classic_era)* | The `.build.info` in the selected folder belongs to a different product. Point the launcher at a Forever Beta (`wow_classic_beta`) or Stress Test (`wowf`) install. |
 | *CAS system was unable to initialize: no active install info entries* | `.build.info` or `_classic_beta_/.flavor.info` is missing on the device. |
+| *BLZ51914400* / unexpected *China Release* | Confirm the selected WoW region in the account card and inspect **Logs** for the latest `launcherPortal` / `loginPortal`, `usedToken` and server response. Fixing a portal does not guarantee authentication; see [login verification and limitations](LOGIN_REGIONS.md). |
 | *No realms available* / no servers listed | The device client is out of date. Tap **Update** on the launcher setup screen, or restart the app with Wi-Fi enabled. |
 | Keyboard doesn't appear | Force-stop Gboard (Settings → Apps → Gboard → Force stop) and open **Keyboard** again. It can get stuck on the second screen. |
 | Returns to the launcher after "Launching Game…" | Check the files under `_classic_beta_/Errors/` on the device. |
@@ -105,7 +136,7 @@ Whenever Blizzard patches the game:
 
 ## Building from source
 
-Requirements: JDK 17 and the Android SDK (with build-tools and platform-tools).
+Requirements: JDK 21 and the Android SDK (with build-tools and platform-tools).
 
 ```bash
 tools/fetch_components.sh           # Wine/Proton, DXVK and Turnip archives (~130 MB, not in git)
@@ -113,9 +144,15 @@ tools/fetch_components.sh           # Wine/Proton, DXVK and Turnip archives (~13
 ./gradlew assembleModernDebug       # unminified debug build, faster to iterate on
 ```
 
+On Windows:
+
+```powershell
+.\tools\fetch_components.ps1       # or tools\fetch_components.bat
+```
+
 Release builds are signed with `app/keystores/keystore.properties` when it exists (`storeFile`, `storePassword`, `keyAlias`, `keyPassword`). Otherwise they fall back to the debug key. Builds signed with different keys can't update each other, so switching between them means uninstalling first.
 
-`fetch_components.sh` downloads the three runtime archives from this repo's `components-v1` release and checks them against `tools/components.sha256`. If you already have them, pass a folder instead: `tools/fetch_components.sh /path/to/components`.
+`fetch_components.sh` downloads the four runtime archives from this repo's `components-v1` release and checks them against `tools/components.sha256`. If you already have them, pass a folder instead: `tools/fetch_components.sh /path/to/components`.
 
 ---
 

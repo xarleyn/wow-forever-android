@@ -13,6 +13,8 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -20,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -29,9 +32,14 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -39,12 +47,17 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import app.gamenative.PluviaApp
 import app.gamenative.R
 import app.gamenative.events.AndroidEvent
@@ -52,6 +65,8 @@ import app.gamenative.ui.theme.BrandGradient
 import app.gamenative.ui.theme.PluviaTheme
 import app.gamenative.ui.theme.WowBackgroundGradient
 import app.gamenative.ui.theme.WowGold
+import app.gamenative.utils.LogBuffer
+import kotlinx.coroutines.delay
 
 @Composable
 fun BootingSplash(
@@ -124,13 +139,16 @@ fun BootingSplash(
             modifier = Modifier
                 .fillMaxSize()
                 .background(Brush.verticalGradient(WowBackgroundGradient)),
-            contentAlignment = Alignment.Center,
+            contentAlignment = Alignment.TopCenter,
         ) {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.padding(horizontal = 32.dp),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 32.dp)
+                    .verticalScroll(rememberScrollState()),
             ) {
-                Spacer(modifier = Modifier.weight(0.4f))
+                Spacer(modifier = Modifier.height(72.dp))
 
                 Text(
                     text = "World of Warcraft",
@@ -183,7 +201,65 @@ fun BootingSplash(
                     textAlign = TextAlign.Center,
                 )
 
-                Spacer(modifier = Modifier.weight(0.4f))
+                var bootLogs by remember { mutableStateOf("") }
+                var logsCopied by remember { mutableStateOf(false) }
+                LaunchedEffect(logsCopied) {
+                    if (logsCopied) {
+                        delay(2000)
+                        logsCopied = false
+                    }
+                }
+                val context = LocalContext.current
+                LaunchedEffect(Unit) {
+                    while (true) {
+                        bootLogs = LogBuffer.snapshot
+                            .takeLast(6)
+                            .reversed()
+                            .map { if (it.length > 100) it.take(97) + "..." else it }
+                            .joinToString("\n")
+                        delay(500)
+                    }
+                }
+                if (bootLogs.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(0.92f)
+                            .heightIn(max = 170.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color.Black.copy(alpha = 0.35f))
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                    ) {
+                        Text(
+                            text = bootLogs,
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                fontSize = 9.sp,
+                                lineHeight = 12.sp,
+                                fontFamily = FontFamily.Monospace,
+                            ),
+                            color = Color.White.copy(alpha = 0.65f),
+                            textAlign = TextAlign.Start,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .verticalScroll(rememberScrollState()),
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    TextButton(
+                        onClick = {
+                            copyBootLogs(context, bootLogs)
+                            logsCopied = true
+                        }
+                    ) {
+                        Text(
+                            if (logsCopied) "Logs copied to clipboard" else "Copy logs",
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                            color = WowGold.copy(alpha = 0.9f),
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(72.dp))
             }
 
             if (onAbort != null) {
@@ -203,6 +279,11 @@ fun BootingSplash(
             }
         }
     }
+}
+
+private fun copyBootLogs(context: Context, text: String) {
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+    clipboard?.setPrimaryClip(ClipData.newPlainText("WoW Forever logs", text))
 }
 
 @Composable

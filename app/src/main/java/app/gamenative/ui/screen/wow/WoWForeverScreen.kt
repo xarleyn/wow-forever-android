@@ -1,6 +1,9 @@
 package app.gamenative.ui.screen.wow
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.os.Build
 import android.os.Environment
 import android.view.WindowManager
@@ -14,9 +17,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.FolderOpen
-import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Warning
@@ -38,9 +39,8 @@ import app.gamenative.BuildConfig
 import app.gamenative.PluviaApp
 import app.gamenative.events.AndroidEvent
 import app.gamenative.ui.screen.wow.WowClientDownloader.BUILD_INFO
-import app.gamenative.ui.screen.wow.WowClientDownloader.EXE_NAME
-import app.gamenative.ui.screen.wow.WowClientDownloader.FLAVOR_DIR
-import app.gamenative.ui.screen.wow.WowClientDownloader.TARGET_PRODUCT
+import app.gamenative.ui.screen.wow.WoWProductProfile
+import app.gamenative.ui.screen.wow.WoWProducts
 import app.gamenative.ui.theme.WowBackgroundGradient
 import app.gamenative.ui.theme.WowBronze
 import app.gamenative.ui.theme.WowError
@@ -48,6 +48,7 @@ import app.gamenative.ui.theme.WowGold
 import app.gamenative.ui.theme.WowMuted
 import app.gamenative.ui.theme.WowSubtle
 import app.gamenative.utils.AppUpdater
+import app.gamenative.utils.LogBuffer
 import app.gamenative.utils.StorageUtils
 import app.gamenative.utils.renderReleaseNotes
 import com.winlator.container.Container
@@ -91,10 +92,17 @@ fun WoWForeverScreen(
     var files by remember { mutableStateOf(GamePath.Status()) }
     var isLaunching by remember { mutableStateOf(false) }
     var launchJob by remember { mutableStateOf<Job?>(null) }
-    var hasSavedLogin by remember { mutableStateOf(BattleNetSignIn.load(context) != null) }
+    val accountStore = remember { BattleNetSignIn.store(context) }
+    val initialAccounts = remember { runCatching { accountStore.accounts() to accountStore.active() } }
+    var accounts by remember { mutableStateOf(initialAccounts.getOrNull()?.first.orEmpty()) }
+    var activeAccount by remember { mutableStateOf(initialAccounts.getOrNull()?.second) }
+    val hasSavedLogin = activeAccount?.region != null
+    var isManagingAccount by remember { mutableStateOf(false) }
+    var editingAccount by remember { mutableStateOf<BattleNetAccount?>(null) }
+    var editingLogin by remember { mutableStateOf<BattleNetSignIn.Login?>(null) }
     var showLoginDialog by remember { mutableStateOf(false) }
     var statusText by remember { mutableStateOf(READY_STATUS) }
-    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var errorMessage by remember { mutableStateOf<String?>(if (initialAccounts.isFailure) "Saved accounts could not be read. Existing data has been kept." else null) }
     var showStoragePermissionDialog by remember { mutableStateOf(false) }
     var versionStatus by remember { mutableStateOf<WowClientDownloader.VersionCheckResult?>(null) }
     var isCheckingVersion by remember { mutableStateOf(false) }
@@ -107,6 +115,112 @@ fun WoWForeverScreen(
     var showAppUpdatePermissionDialog by remember { mutableStateOf(false) }
     var pendingInstallPermission by remember { mutableStateOf(false) }
     var downloadedApk by remember { mutableStateOf<File?>(null) }
+    var selectedTab by remember { mutableIntStateOf(0) }
+    var logsText by remember { mutableStateOf("") }
+    var isLogsLoading by remember { mutableStateOf(false) }
+    var logsCopied by remember { mutableStateOf(false) }
+
+
+    fun refreshAccounts() {
+        accounts = accountStore.accounts()
+        activeAccount = accountStore.active()
+    }
+
+    fun manageAccount(action: () -> Unit) {
+        if (isManagingAccount || isLaunching || isUpdating) return
+        isManagingAccount = true
+        errorMessage = null
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) { action() }
+                refreshAccounts()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                errorMessage = "Couldn't update the account or game config. Check storage access and saved credentials."
+            } finally {
+                isManagingAccount = false
+            }
+        }
+    }
+
+    fun selectAccount(account: BattleNetAccount) = manageAccount {
+        check(BattleNetSignIn.removeLoginFile(File(gamePath))) { "Couldn't remove previous game login" }
+        if (account.region != null && files.buildInfoExists && !files.isWrongGame) {
+            applyAccountPortal(File(gamePath), WowClientDownloader.profileForGameRoot(File(gamePath)), account.region)
+        }
+        accountStore.select(account.id)
+    }
+
+    fun openAccountDialog(account: BattleNetAccount?) {
+        try {
+            editingLogin = account?.let { accountStore.login(it.id) }
+            editingAccount = account
+            showLoginDialog = true
+        } catch (_: Exception) {
+            // Keep ciphertext so an unavailable Keystore never wipes other saved accounts.
+            editingAccount = account
+            editingLogin = account?.let { BattleNetSignIn.Login(it.email, "") }
+            showLoginDialog = true
+            errorMessage = "Saved password couldn't be read. Enter it again to update this profile."
+        }
+    }
+
+    fun loadLogs() {
+        if (isLogsLoading) return
+        isLogsLoading = true
+        scope.launch {
+            val buffer = withContext(Dispatchers.IO) { LogBuffer.snapshot.joinToString("\n") }
+            val logcat = withContext(Dispatchers.IO) {
+                runCatching {
+                    val pid = android.os.Process.myPid()
+                    val proc = Runtime.getRuntime().exec(
+                        arrayOf("logcat", "-d", "-v", "threadtime", "--pid=$pid", "-t", "2000")
+                    )
+                    proc.inputStream.bufferedReader().readText()
+                }.getOrElse { "logcat unavailable: ${it.message}" }
+            }
+            val connection = withContext(Dispatchers.IO) {
+                val root = File(gamePath)
+                WoWConnectionDiagnostics.read(root, WowClientDownloader.profileForGameRoot(root))
+            }
+            logsText = connection + "\n\n=== App log ===\n" +
+                WoWConnectionDiagnostics.sanitize(listOf(buffer, logcat).filter { it.isNotBlank() }.joinToString("\n"))
+            isLogsLoading = false
+        }
+    }
+
+    // Keep the log view fresh while the Logs tab is open.
+    LaunchedEffect(selectedTab, gamePath) {
+        while (selectedTab == 1) {
+            loadLogs()
+            delay(3000)
+        }
+    }
+
+    fun copyLogs() {
+        if (logsText.isBlank()) return
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        clipboard?.setPrimaryClip(ClipData.newPlainText("WoW Forever logs", logsText))
+        logsCopied = true
+        scope.launch {
+            delay(2000)
+            logsCopied = false
+        }
+    }
+
+    fun shareLogs() {
+        if (logsText.isBlank()) return
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, "WoW Forever logs")
+            putExtra(Intent.EXTRA_TEXT, logsText)
+        }
+        val chooser = Intent.createChooser(intent, "Share logs").apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        runCatching { context.startActivity(chooser) }
+    }
 
     suspend fun fetchAppUpdate(): AppUpdater.Release? {
         val release = AppUpdater.check()
@@ -170,7 +284,7 @@ fun WoWForeverScreen(
     fun checkFiles(): Boolean {
         files = GamePath.status(context, gamePath)
         if (files.isWrongGame) {
-            errorMessage = "Incompatible game (${files.product}). WoW Forever requires World of Warcraft Classic Beta ($TARGET_PRODUCT)."
+            errorMessage = "Incompatible game (${files.product}). WoW Forever supports ${WoWProducts.supported.map { it.displayName }.joinToString(" or ")}."
         }
         return files.isReady
     }
@@ -188,11 +302,17 @@ fun WoWForeverScreen(
     }
 
     fun launchGame() {
-        if (isLaunching || files.isWrongGame) return
+        if (isLaunching || isManagingAccount || files.isWrongGame) return
         if (!files.hasStorageAccess) {
             showStoragePermissionDialog = true
             return
         }
+        if (activeAccount?.region == null) {
+            errorMessage = "Choose an account and confirm its WoW region before playing."
+            openAccountDialog(activeAccount)
+            return
+        }
+        val launchAccount = activeAccount!!
         isLaunching = true
         errorMessage = null
         statusText = "Preparing components..."
@@ -201,7 +321,7 @@ fun WoWForeverScreen(
             try {
                 val screenSize = fitScreenSizeToWindow(context, gpu.screenSize)
                 val containerId = withContext(Dispatchers.IO) {
-                    prepareLaunch(context, File(gamePath), gpu, screenSize) { msg ->
+                    prepareLaunch(context, File(gamePath), gpu, screenSize, launchAccount) { msg ->
                         scope.launch(Dispatchers.Main) { statusText = msg }
                     }
                 }
@@ -276,7 +396,7 @@ fun WoWForeverScreen(
     }
 
     val filesMissing = !(files.dataExists && files.buildInfoExists)
-    val canPlay = !isLaunching && !isUpdating && !filesMissing && !files.isWrongGame
+    val canPlay = !isLaunching && !isUpdating && !isManagingAccount && !filesMissing && !files.isWrongGame
 
     fun performUpdate() {
         val target = versionStatus ?: return
@@ -349,11 +469,8 @@ fun WoWForeverScreen(
             .padding(24.dp)
     ) {
         Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState()),
+            modifier = Modifier.fillMaxSize(),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.SpaceBetween
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Spacer(modifier = Modifier.height(20.dp))
@@ -366,7 +483,7 @@ fun WoWForeverScreen(
                     color = Color(0xFFF0E6D2)
                 )
                 Text(
-                    text = "FOREVER BETA (ARM64 NATIVE)",
+                    text = "${WoWProducts.find(files.product)?.displayName?.uppercase() ?: "FOREVER"} (ARM64 NATIVE)",
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
                     letterSpacing = 2.sp,
@@ -376,8 +493,44 @@ fun WoWForeverScreen(
                 Text(text = "${gpu.edition} Edition", fontSize = 11.sp, color = WowSubtle)
             }
 
-            Spacer(modifier = Modifier.height(20.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
+            TabRow(
+                selectedTabIndex = selectedTab,
+                containerColor = Color(0xFF131D2E).copy(alpha = 0.85f),
+                contentColor = WowGold,
+            ) {
+                Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("Status") })
+                Tab(selected = selectedTab == 1, onClick = { selectedTab = 1; loadLogs() }, text = { Text("Logs") })
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Box(modifier = Modifier.weight(1f)) {
+            if (selectedTab == 0) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+            BattleNetAccountCard(
+                accounts = accounts,
+                active = activeAccount,
+                enabled = !isLaunching && !isUpdating && !isManagingAccount,
+                onSelect = ::selectAccount,
+                onAdd = { openAccountDialog(null) },
+                onEdit = { activeAccount?.let { openAccountDialog(it) } },
+                onRemove = {
+                    activeAccount?.let { account ->
+                        manageAccount {
+                            check(BattleNetSignIn.removeLoginFile(File(gamePath)))
+                            accountStore.remove(account.id)
+                        }
+                    }
+                },
+            )
+            Spacer(Modifier.height(12.dp))
             Card(
                 modifier = Modifier
                     .fillMaxWidth(0.9f)
@@ -390,15 +543,15 @@ fun WoWForeverScreen(
                     Spacer(modifier = Modifier.height(14.dp))
 
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        CheckItem(label = if (files.exeExists) "ARM64 Binary ($EXE_NAME)" else "ARM64 Binary (downloads on Play)", ready = files.exeExists)
+                        CheckItem(label = if (files.exeExists) "ARM64 Binary (${WowClientDownloader.profileForGameRoot(File(gamePath)).executableName})" else "ARM64 Binary (downloads on Play)", ready = files.exeExists)
                         CheckItem(label = "Game Asset Archives (Data/)", ready = files.dataExists)
                         CheckItem(
-                            label = if (files.isWrongGame) "Install Info ($BUILD_INFO - requires $TARGET_PRODUCT)" else "Install Info ($BUILD_INFO)",
+                            label = if (files.isWrongGame) "Install Info ($BUILD_INFO - requires a supported product)" else "Install Info ($BUILD_INFO)",
                             ready = files.buildInfoExists && !files.isWrongGame
                         )
                         CheckItem(label = "All Files Access Permission", ready = files.hasStorageAccess)
                         CheckItem(
-                            label = if (hasSavedLogin) "Battle.net Login (Configured)" else "Battle.net Login (Configure below play button)",
+                            label = if (hasSavedLogin) "Battle.net Login (Configured)" else "Battle.net Login (select account and region above)",
                             ready = hasSavedLogin,
                         )
                         appUpdate?.let {
@@ -510,17 +663,66 @@ fun WoWForeverScreen(
                 }
             }
 
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(16.dp))
+            }
+            } else {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth(0.9f)
+                        .fillMaxHeight(),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        SectionTitle("LOGS", WowGold)
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            TextButton(onClick = { loadLogs() }) { Text("Refresh", color = WowGold) }
+                            TextButton(onClick = { copyLogs() }) {
+                                Text(if (logsCopied) "Copied" else "Copy", color = WowGold)
+                            }
+                            TextButton(onClick = { shareLogs() }) { Text("Share", color = WowGold) }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    if (isLogsLoading) {
+                        CircularProgressIndicator(color = WowGold, modifier = Modifier.size(24.dp))
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f)
+                                .border(1.dp, Color(0xFF2A3C54), RoundedCornerShape(12.dp))
+                                .background(Color(0xFF0B1220).copy(alpha = 0.8f), RoundedCornerShape(12.dp))
+                                .padding(10.dp),
+                        ) {
+                            Text(
+                                text = logsText.ifBlank { "No logs yet. Tap Refresh." },
+                                fontSize = 10.sp,
+                                lineHeight = 14.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = Color(0xFFCBD5E1),
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .verticalScroll(rememberScrollState()),
+                            )
+                        }
+                    }
+                }
+            }
+            }
 
             Column(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                if (isLaunching || isUpdating || (isCheckingVersion && WoWLauncherState.shouldAutoLaunch)) {
+                if (isLaunching || isUpdating || isManagingAccount || (isCheckingVersion && WoWLauncherState.shouldAutoLaunch)) {
                     CircularProgressIndicator(color = WowGold, modifier = Modifier.size(36.dp))
                     Spacer(modifier = Modifier.height(12.dp))
                     Text(
                         text = when {
+                            isManagingAccount -> "Updating account and game region..."
                             isUpdating -> updateStatusText
                             isLaunching -> statusText
                             else -> "Checking for game updates..."
@@ -568,7 +770,7 @@ fun WoWForeverScreen(
                             onClick = { StorageUtils.requestManageExternalStoragePermission(context) },
                         )
                         else -> PrimaryButton(
-                            text = if (files.isWrongGame) "FOREVER BETA REQUIRED" else "PLAY WORLD OF WARCRAFT",
+                            text = if (files.isWrongGame) "SUPPORTED CLIENT REQUIRED" else "PLAY WORLD OF WARCRAFT",
                             icon = Icons.Default.PlayArrow,
                             enabled = canPlay,
                             onClick = ::launchGame,
@@ -589,34 +791,27 @@ fun WoWForeverScreen(
                         if (!filesMissing) {
                             LinkButton("Change Location", Icons.Default.FolderOpen) { folderPicker.launch(null) }
                         }
-                        LinkButton(
-                            text = if (hasSavedLogin) "Update Login" else "Configure Login",
-                            icon = Icons.Default.Key,
-                        ) {
-                            showLoginDialog = true
-                        }
-                        if (hasSavedLogin) {
-                            LinkButton("Forget Saved Login", Icons.Default.Delete) {
-                                BattleNetSignIn.forget(context)
-                                BattleNetSignIn.removeLoginFile(File(gamePath))
-                                hasSavedLogin = false
-                            }
-                        }
+
                     }
                 }
             }
-
-            Spacer(modifier = Modifier.height(16.dp))
         }
     }
 
     if (showLoginDialog) {
         BattleNetCredentialDialog(
-            onDismiss = { showLoginDialog = false },
-            onConfirm = { login ->
+            onDismiss = { showLoginDialog = false; editingLogin = null },
+            initial = editingAccount,
+            initialLogin = editingLogin,
+            onConfirm = { label, region, login ->
+                val id = editingAccount?.id
                 showLoginDialog = false
-                BattleNetSignIn.save(context, login)
-                hasSavedLogin = true
+                editingLogin = null
+                manageAccount {
+                    check(BattleNetSignIn.removeLoginFile(File(gamePath)))
+                    if (files.buildInfoExists && !files.isWrongGame) applyAccountPortal(File(gamePath), WowClientDownloader.profileForGameRoot(File(gamePath)), region)
+                    accountStore.save(id, label, region, login)
+                }
             },
         )
     }
@@ -776,6 +971,7 @@ fun WoWForeverScreen(
 object GamePath {
     private const val PREFS = "wow_forever"
     private const val KEY_GAME_PATH = "game_path"
+    private const val KEY_PRODUCT = "product_id"
 
     private val defaultPath = File(Environment.getExternalStorageDirectory(), "WoW Forever")
 
@@ -786,33 +982,47 @@ object GamePath {
         val product: String = "",
         val hasStorageAccess: Boolean = true,
     ) {
-        val isWrongGame get() = buildInfoExists && product.isNotBlank() && product != TARGET_PRODUCT
+        val isWrongGame get() = buildInfoExists && product.isNotBlank() && !WoWProducts.isSupported(product)
         val isReady get() = exeExists && dataExists && buildInfoExists && hasStorageAccess && !isWrongGame
     }
 
     fun status(context: Context, path: String): Status {
         val root = File(path)
+        val product = productOf(root).orEmpty()
+        val profile = WoWProducts.find(product)
         return Status(
-            exeExists = File(root, "$FLAVOR_DIR/$EXE_NAME").exists(),
+            exeExists = profile?.let { WowClientDownloader.resolveExecutable(root, it) != null } ?: false,
             dataExists = File(root, "Data").listFiles()?.isNotEmpty() == true,
             buildInfoExists = File(root, BUILD_INFO).isFile,
-            product = productOf(root).orEmpty(),
+            product = product,
             hasStorageAccess = StorageUtils.hasStoragePermission(context, path),
         )
     }
 
     fun load(context: Context): String {
-        val saved = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_GAME_PATH, null)?.let(::File)
-        val usable = listOfNotNull(saved, defaultPath).firstOrNull { productOf(it) == TARGET_PRODUCT }
-        return (usable ?: saved ?: defaultPath).absolutePath
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val saved = prefs.getString(KEY_GAME_PATH, null)?.let(::File)
+        val usable = listOfNotNull(saved, defaultPath).firstOrNull { WoWProducts.isSupported(productOf(it)) }
+        val chosen = (usable ?: saved ?: defaultPath)
+        val product = productOf(chosen)
+        if (product != null) {
+            prefs.edit().putString(KEY_PRODUCT, product).apply()
+            WowClientDownloader.selectedProductId = product
+        }
+        return chosen.absolutePath
     }
 
-    fun save(context: Context, path: String) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_GAME_PATH, path).apply()
+    fun save(context: Context, path: String, productId: String? = null) {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+        prefs.putString(KEY_GAME_PATH, path)
+        val resolved = productId ?: productOf(File(path))
+        if (resolved != null) prefs.putString(KEY_PRODUCT, resolved)
+        prefs.apply()
+        if (resolved != null) WowClientDownloader.selectedProductId = resolved
     }
 
     fun isReady(context: Context, path: String = load(context)): Boolean =
-        path.isNotEmpty() && status(context, path).let { it.isReady && it.product == TARGET_PRODUCT }
+        path.isNotEmpty() && status(context, path).let { it.isReady }
 
     fun findGameRoot(picked: File): File? =
         sequenceOf(picked, picked.parentFile, File(picked, "WoW Forever"), File(picked, "World of Warcraft"))
@@ -917,29 +1127,30 @@ internal fun fitScreenSize(baseSize: String, windowWidth: Int, windowHeight: Int
     return "${(width / 2).roundToInt() * 2}x${(height / 2).roundToInt() * 2}"
 }
 
-private fun prepareLaunch(context: Context, gameRoot: File, gpu: GpuProfile, screenSize: String, onStatus: (String) -> Unit): String {
+private fun prepareLaunch(context: Context, gameRoot: File, gpu: GpuProfile, screenSize: String, account: BattleNetAccount, onStatus: (String) -> Unit): String {
+    val login = BattleNetSignIn.store(context).login(account.id)
     installBundledComponents(context, onStatus)
 
     check(File(gameRoot, BUILD_INFO).exists()) { "Missing $BUILD_INFO in $gameRoot. Copy it from your WoW install." }
+    val profile = WowClientDownloader.profileForGameRoot(gameRoot)
     try {
-        ensureGameConfig(gameRoot, screenSize)
+        ensureGameConfig(gameRoot, screenSize, profile, account.region)
     } catch (e: Exception) {
         if (e.isPermissionDenied()) throw StorageAccessDeniedException(e)
         throw e
     }
 
-    val arm64Exe = File(gameRoot, "$FLAVOR_DIR/$EXE_NAME")
-    BattleNetSignIn.load(context)?.let { login ->
-        BattleNetSignIn.writeLoginFile(gameRoot, login)
-        BattleNetSignIn.startLoginWatcher(gameRoot)
-    }
-    if (!arm64Exe.exists()) {
+    var arm64Exe = WowClientDownloader.resolveExecutable(gameRoot, profile)
+    if (arm64Exe == null) {
         try {
             WowClientDownloader.download(gameRoot, onStatus)
         } catch (e: Exception) {
-            if (!arm64Exe.exists()) throw IllegalStateException("Couldn't download $EXE_NAME: ${e.message}", e)
-            Timber.w(e, "Client update check failed, launching the existing $EXE_NAME")
+            arm64Exe = WowClientDownloader.resolveExecutable(gameRoot, profile)
+            if (arm64Exe == null) throw IllegalStateException("Couldn't download ${profile.executableName}: ${e.message}", e)
+            Timber.w(e, "Client update check failed, launching the existing ${arm64Exe.name}")
         }
+        arm64Exe = WowClientDownloader.resolveExecutable(gameRoot, profile)
+            ?: throw IllegalStateException("Couldn't download ${profile.executableName}")
     }
 
     onStatus("Configuring ${gpu.label} container...")
@@ -954,10 +1165,16 @@ private fun prepareLaunch(context: Context, gameRoot: File, gpu: GpuProfile, scr
         container.saveData()
     }
     check(containerManager.hasContainer(CONTAINER_ID)) { "Container creation failed. Check system storage and logs." }
+    // Write credentials only when downloads and prefix creation have succeeded.
+    check(BattleNetSignIn.removeLoginFile(gameRoot)) { "Couldn't remove previous game login" }
+    BattleNetSignIn.writeLoginFile(gameRoot, login)
+    BattleNetSignIn.startLoginWatcher(gameRoot)
     return CONTAINER_ID
 }
 
 private fun containerConfig(gameRoot: File, gpu: GpuProfile, screenSize: String): JSONObject {
+    val profile = WowClientDownloader.profileForGameRoot(gameRoot)
+    val exeName = WowClientDownloader.resolveExecutable(gameRoot, profile)?.name ?: profile.executableName
     val samsungEnv = if (Build.MANUFACTURER.equals("samsung", ignoreCase = true)) " FD_DEV_FEATURES=enable_tp_ubwc_flag_hint=1" else ""
     val envVars = "WRAPPER_MAX_IMAGE_COUNT=0 ZINK_DESCRIPTORS=lazy ZINK_DEBUG=compact,deck_emu MESA_SHADER_CACHE_DISABLE=false MESA_SHADER_CACHE_MAX_SIZE=512MB mesa_glthread=true WINEESYNC=0 MESA_VK_WSI_PRESENT_MODE=mailbox TU_DEBUG=${gpu.tuDebug} VKD3D_SHADER_MODEL=6_0 PULSE_LATENCY_MSEC=144$samsungEnv"
     return JSONObject().apply {
@@ -975,7 +1192,7 @@ private fun containerConfig(gameRoot: File, gpu: GpuProfile, screenSize: String)
         put("containerVariant", "bionic")
         put("fexcoreVersion", "2609-0")
         put("drives", "D:/storage/emulated/0/DownloadE:/data/data/app.wowforever/storageG:${gameRoot.path}")
-        put("executablePath", "G:\\$FLAVOR_DIR\\$EXE_NAME")
+        put("executablePath", "G:\\${profile.flavorDir}\\$exeName")
         put("execArgs", "-d3d11")
         put("showFPS", true)
         put("startupSelection", Container.STARTUP_SELECTION_AGGRESSIVE.toInt())
@@ -984,78 +1201,14 @@ private fun containerConfig(gameRoot: File, gpu: GpuProfile, screenSize: String)
     }
 }
 
-private val CONFIG_DEFAULTS = linkedMapOf(
-    "portal" to "\"test\"",
-    "agentUID" to "\"$TARGET_PRODUCT\"",
-    "gxApi" to "\"D3D11\"",
-    "textLocale" to "\"enUS\"",
-    "audioLocale" to "\"enUS\"",
-    "gxMaximize" to "\"1\"",
-    "graphicsQuality" to "\"0\"",
-    "ResampleQuality" to "\"0\"",
-    "RenderScale" to "\"1\"",
-    "farclip" to "\"1200\"",
-    "horizonClip" to "\"1200\"",
-    "RAIDfarclip" to "\"1200\"",
-    "RAIDhorizonClip" to "\"1200\"",
-    "shadowMode" to "\"0\"",
-    "graphicsShadowQuality" to "\"0\"",
-    "raidGraphicsShadowQuality" to "\"0\"",
-    "worldBaseMip" to "\"0\"",
-    "RAIDworldBaseMip" to "\"0\"",
-    "graphicsTextureResolution" to "\"2\"",
-    "raidGraphicsTextureResolution" to "\"2\"",
-    "componentTextureLevel" to "\"0\"",
-    "RAIDcomponentTextureLevel" to "\"0\"",
-    "entityShadowFadeScale" to "\"0\"",
-    "refraction" to "\"0\"",
-    "groundEffectDensity" to "\"16\"",
-    "GamePadEnable" to "\"1\"",
-    "InputDeviceInterfaceStyle" to "\"1\"",
-)
-
-private fun ensureGameConfig(root: File, screenSize: String) {
-    val flavorDir = File(root, FLAVOR_DIR)
-    flavorDir.mkdirs()
-    val flavorInfo = File(flavorDir, ".flavor.info")
-    if (!flavorInfo.exists()) {
-        flavorInfo.writeText("Product Flavor!STRING:0\n$TARGET_PRODUCT\n")
-    }
-    // Handheld defaults are only written on first boot so in-game changes stick, with two exceptions.
-    // gxApi is always forced: DXVK only works with D3D11, and a config copied from a Mac would otherwise
-    // select Metal. Resolutions are reset when missing or no longer fitting the screen (e.g. after a fold
-    // or unfold): WoW's "auto" otherwise picks a 720p size because it sees a low-end Intel GPU via Wine.
-    val configWtf = File(flavorDir, "WTF/Config.wtf")
-    if (!configWtf.exists()) {
-        configWtf.parentFile?.mkdirs()
-        val defaults = CONFIG_DEFAULTS + RESOLUTION_KEYS.associateWith { "\"$screenSize\"" }
-        configWtf.writeText(defaults.entries.joinToString("\n") { "SET ${it.key} ${it.value}" } + "\n")
-        return
-    }
-
-    val gxApi = "SET gxApi ${CONFIG_DEFAULTS.getValue("gxApi")}"
-    val original = configWtf.readLines()
-    val staleResolutionKeys = RESOLUTION_KEYS.filter { key ->
-        val line = original.firstOrNull { it.startsWith("SET $key ", ignoreCase = true) }
-        line == null || !fitsScreen(line.substringAfter(" ").substringAfter(" ").trim('"'), screenSize)
-    }
-    val updated = original.filterNot { line ->
-        line.startsWith("SET gxApi ", ignoreCase = true) || staleResolutionKeys.any { line.startsWith("SET $it ", ignoreCase = true) }
-    } + gxApi + staleResolutionKeys.map { "SET $it \"$screenSize\"" }
-    if (original.none { it == gxApi } || staleResolutionKeys.isNotEmpty()) {
-        configWtf.writeText(updated.joinToString("\n") + "\n")
-    }
-}
-
-private val RESOLUTION_KEYS = listOf("gxFullscreenResolution", "gxWindowedResolution")
-
-internal fun fitsScreen(resolution: String, screenSize: String): Boolean {
-    val (width, height) = resolution.split("x").map { it.toIntOrNull() ?: return false }.takeIf { it.size == 2 } ?: return false
-    val (screenWidth, screenHeight) = screenSize.split("x").map { it.toInt() }
-    return width in 1..screenWidth && height in 1..screenHeight
-}
 
 private fun installBundledComponents(context: Context, onStatus: (String) -> Unit) {
+    val missing = BUNDLED_COMPONENTS.filter { assetExists(context, it) .not() }
+    check(missing.isEmpty()) {
+        "Missing bundled components: ${missing.joinToString(", ")}. " +
+            "Run tools/fetch_components (or fetch_components.ps1/.bat) and rebuild the app."
+    }
+
     installDriver(context, DEFAULT_DRIVER, "turnip-wow-scheduler-test.zip", onStatus)
     installDriver(context, ADRENO_8XX_DRIVER, "turnip-V32-RP6sched.zip", onStatus)
 
@@ -1078,6 +1231,16 @@ private fun installBundledComponents(context: Context, onStatus: (String) -> Uni
     ImageFsInstaller.ensureBionicLib(context, ImageFs.find(context).rootDir)
     ContentsManager(context).syncContents()
 }
+
+private val BUNDLED_COMPONENTS = listOf(
+    "proton-11.0-90624-arm64ec.wcp",
+    "dxvk-2.4.1-wow-aarch64-test.wcp",
+    "turnip-wow-scheduler-test.zip",
+    "turnip-V32-RP6sched.zip",
+)
+
+private fun assetExists(context: Context, assetName: String): Boolean =
+    runCatching { context.assets.open("bundled_components/$assetName").close(); true }.getOrDefault(false)
 
 private fun installDriver(context: Context, driverName: String, assetZip: String, onStatus: (String) -> Unit) {
     val driverDir = File(context.filesDir, "contents/adrenotools/$driverName")

@@ -82,3 +82,9 @@ WowB-ARM64/
 
 # Agent guidance (private)
 docs/
+
+# Local development tooling binaries
+tools/*.exe
+tools/*.dll
+tools/scrcpy-server
+tools/icon.png
