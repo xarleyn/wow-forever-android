@@ -1,4 +1,4 @@
-# Account regions and BLZ51914400
+# Account regions, official Battle.net and login diagnostics
 
 The launcher supports named Battle.net launch profiles with an explicit WoW account region:
 EU (Europe), US (Americas), KR (Korea) or TW (Taiwan). Profiles can share the same email,
@@ -55,7 +55,7 @@ compare the latest timestamps, not just any occurrence of a hostname or error.
 On an attached device, verify both EU and US using actual accounts:
 
 1. Cancel auto-launch with Back to reach Status. Confirm the migrated profile's region.
-2. Add a second profile, switch EU → US → EU, and inspect the existing selected product's
+2. Add a second profile, switch EU â†’ US â†’ EU, and inspect the existing selected product's
    `WTF/Config.wtf`. Its portal must follow the profile without losing custom settings.
 3. Launch and inspect the region label and the latest `launcherPortal` / `loginPortal` in Logs.
    EU should be checked against the PC reference `eu.actual.battle.net`.
@@ -65,14 +65,82 @@ On an attached device, verify both EU and US using actual accounts:
 5. For beta, confirm `portal "test"` is retained. For both products, verify profile edits,
    deletion, keyboard input and narrow-screen layout on the physical device.
 
-Community users describe installing the official Battle.net Windows launcher inside a Wine
-environment as a possible fallback. This fork does not yet implement that mode. It needs its
-own installer/executable selection, architecture/runtime validation and real token-login test;
-do not reuse a PC token or claim that writing `login.txt` supplies one.
+## Official Battle.net mode
 
-ADB reported no attached devices during this implementation. Physical-device layout,
-region-label/portal resolution, successful Android login and the Battle.net launcher fallback
-remain unverified. The existing installed app and game files were not replaced or removed.
+Select **Battle.net** in the **LAUNCH WITH** card to install/open the official Windows
+launcher in the dedicated `wow_battlenet` container. Existing installations retain direct
+launch until this mode is explicitly selected. Sign-in and any verification happen in
+the official client. Saved credentials from direct mode are not supplied to Battle.net.
+
+Game files remain disconnected initially. Enabling game access mounts the selected WoW
+folder as `G:`; the official client can then manage that folder. The app itself does not
+copy a PC account database, import authentication state or generate launch tokens.
+The normal downloader supplies an ARM64 game client; it does not automatically generate
+Battle.net installation metadata. Merely mounting a copied folder does not prove adoption.
+
+The runtime preparation:
+
+- Downloads the official installer over HTTPS from Battle.net and caches it locally.
+- Verifies the checksum-pinned FEX 2609 package and repairs damaged installed copies.
+- Inventories static/delay PE imports and prepares matching Wine DLLs, including the
+  common-controls v6 WinSxS assembly and managed uppercase aliases on Android filesystems.
+  Existing valid native overrides are preserved.
+- Sets only `Client.HardwareAcceleration="false"` to avoid the observed blank Chromium
+  window. Existing account, cache and AutoLogin settings remain client-owned.
+- Runs a small source-built Win32 loader probe before normal launch. Its output and wait
+  are bounded; optional diagnostic failure does not cancel normal client startup.
+- Shows **Keyboard** and **Controls** buttons while Battle.net is open. Gamepad controls
+  start hidden and can be enabled when needed.
+
+The probe tests real COMCTL32 loads under activation contexts and uses a fixed, non-secret
+DPAPI canary to check encryption across launches. It never reads client credentials,
+cookies or authentication tokens. Sources are `tools/battlenet_probe.*`; build the bundled
+EXE with `tools/build_battlenet_probe.ps1` using Visual C++ x86 build tools and Windows SDK.
+No Blizzard executable is bundled in this repository.
+
+### Device findings, 2026-10-23
+
+On a physical ARM64 Android device, EU routing and public HTTP/HTTPS requests through
+WinHTTP inside the application's Wine environment succeeded. A direct password attempt
+still returned 14400 with `usedToken=false`. The game displayed **China Release arm64**
+even while connected to the EU endpoint, so that label is not reliable routing evidence.
+ADB `run-as` socket failures were traced to a different SELinux domain and did not prove
+an application networking failure.
+
+After disabling browser hardware acceleration, the official Battle.net main window
+rendered after user sign-in. Exiting and restarting retained the session; the native
+DPAPI previous-launch check also passed. This verifies those restarts, not indefinite
+session lifetime or exemption from later account challenges.
+
+A separate, same-build import experiment copied only game installation metadata and
+missing bootstrap executables from a PC reference. After backing up and merging only
+the game's installation record, Agent reported `installed=true`, path `G:` and build
+70532. Battle.net displayed **You have pre-installed this game**, version 1.60.1.70532,
+and an **Update** button. This import was a diagnostic operation, not an automatic feature
+of the app. Account/session data and existing game settings were preserved.
+
+Agent subsequently marked the build non-playable with **Permissions check failure (2123)**.
+The client displayed a future availability date and an expired subscription. Recognition
+of the installed game is verified; an in-game character-list launch is still unverified.
+No update, repair or bulk game download was started during that check.
+
+A scan-time Android crash exposed concurrent removal from the shared-memory map while
+X11 detached a buffer. All map access now uses the same monitor. The updated phone
+completed another scan without that crash; an emulator concurrency test also passes.
+
+## Log export
+
+Small Share payloads remain inline. Logs exceeding 4,000 characters or exceeding 100 lines
+are shared as UTF-8 `.txt` attachments through FileProvider with temporary read access.
+Each share is a separate snapshot; later refreshes/shares cannot overwrite an attachment
+already handed to another app. Copy remains text-based. Common account/authentication
+fields and email addresses are redacted before either kind of Share payload is created.
+
+Battle.net diagnostics include bounded loader/runtime output, dependency inventories,
+config booleans and Chromium error categories/codes. Full client config, cookie contents
+and arbitrary browser console messages are not exported. Review any log before sharing it.
+Raw investigation logs, screenshots, device identifiers and local databases stay outside
+version control.
 
 ## Local verification
 
@@ -88,12 +156,19 @@ failed encryption/decryption, deletion without a silent account switch, input-li
 and bounded/redacted connection diagnostics. Android Keystore itself requires device validation;
 storage unit tests inject a cipher so they can verify failure handling independently.
 
-The final host suite has **28 passing tests, 0 failures, 0 skipped**. It includes a Compose
-interaction test for selecting the US profile on a 360 dp screen.
-The migrated-login dialog test is in `app/src/androidTest/` and its Kotlin compilation passes.
-It was moved to device instrumentation because this project's Robolectric/Compose combination
-does not reach idle while the platform dialog is open. That interaction has not been executed
-on a device; do not count it as a passing host test.
+Focused host checks cover region/profile behavior, launcher selection, FEX integrity,
+PE dependency staging, browser configuration preservation, safe diagnostics and bounded
+process capture. Device tests separately cover file-based sharing, loader preparation,
+FEX repair, shared-memory concurrency and toolbar touch targets.
 
-All four bundled runtime assets were read back and SHA-256 checked against
-`tools/components.sha256`.
+`WineNetworkProbeTest` is opt-in: it requires a captured environment in
+`files/tmp/network-probe-env.json` and restarts the target app. Run it only when interrupting
+the current game is acceptable. It sends public HEAD requests and keeps TLS verification.
+Do not commit a captured process environment or client/session files.
+
+`tools/start_test_emulator.ps1` starts a disposable emulator and reports the explicit ADB
+serial to use. The x86 emulator can validate isolated Android components, but its native
+ARM64/Vulkan bridge did not run the complete Wine client successfully. Do not treat those
+component tests as physical-device gameplay acceptance.
+
+All four bundled runtime assets can be verified against `tools/components.sha256`.
