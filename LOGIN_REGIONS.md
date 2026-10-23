@@ -120,13 +120,38 @@ and an **Update** button. This import was a diagnostic operation, not an automat
 of the app. Account/session data and existing game settings were preserved.
 
 Agent subsequently marked the build non-playable with **Permissions check failure (2123)**.
-The client displayed a future availability date and an expired subscription. Recognition
-of the installed game is verified; an in-game character-list launch is still unverified.
-No update, repair or bulk game download was started during that check.
+A later user-triggered update identified a filesystem failure: **Unable to create TACT
+container folder 'G:/Data/'**, preceded by a warning about a symlink at `G:`. This is
+not evidence of an account-entitlement or closed-test rejection. The client separately
+displayed a future availability date and an expired subscription. Recognition of the
+installed game is verified; an in-game character-list launch is still unverified.
+No update, repair or bulk game download was started during the initial adoption check.
 
 A scan-time Android crash exposed concurrent removal from the shared-memory map while
 X11 detached a buffer. All map access now uses the same monitor. The updated phone
 completed another scan without that crash; an emulator concurrency test also passes.
+
+## Updating a shared installation
+
+Both launch modes currently use the same selected game folder. Separate Wine containers
+do not isolate `Data`, `.build.info`, game executables or overlapping DLLs in that folder.
+
+The direct-mode updater explicitly selects Windows ARM64 manifest entries and excludes
+x86_64. The imported PC installation is tagged Windows x86_64; Battle.net has not been
+validated to keep the ARM64 executable and its dependencies in sync while updating the
+shared CASC data. A Battle.net update/repair can therefore leave incompatible versions
+for direct launch even if `Wow-ARM64.exe` remains present.
+
+Until that update path is validated, use the direct-mode updater for the shared ARM64
+installation. Avoid alternating update/repair tools on it. Test Battle.net patching on
+a separate installation, or first configure and verify its ARM64 selection, then verify
+both the installed manifest/binary versions and an actual direct-mode game launch.
+Neither an Update button nor a successful patch alone establishes cross-mode compatibility.
+
+The 2026-10-23 CDN check still reported wowf build 1.60.1.70532 with the same build-config
+key as the phone, but a different CDN-config key. An Update button did not establish a
+new client build in that case. The original ARM64 executable still matched the reference
+after the failed Agent update attempts.
 
 ## Log export
 
