@@ -4,7 +4,8 @@ $ErrorActionPreference = 'Stop'
 
 $repoDir = Split-Path -Parent $PSScriptRoot
 $dest = Join-Path $repoDir 'app\src\main\assets\bundled_components'
-$releaseUrl = if ($env:COMPONENTS_URL) { $env:COMPONENTS_URL } else { 'https://github.com/xarleyn/wow-forever-android/releases/download/components-v1' }
+# GitHub forks do not inherit release assets; these pinned runtimes live upstream.
+$releaseUrl = if ($env:COMPONENTS_URL) { $env:COMPONENTS_URL } else { 'https://github.com/jaredgei/wow-forever-android/releases/download/components-v1' }
 
 $files = @(
     'proton-11.0-90624-arm64ec.wcp',
