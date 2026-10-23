@@ -204,7 +204,7 @@ public abstract class ProcessHelper {
         Thread stdoutDrainer = null;
         Thread stderrDrainer = null;
         try {
-            if (BuildConfig.MODERN_ANDROID) command = "/system/bin/linker64 " + command;
+            if (BuildConfig.MODERN_ANDROID) command = modernLinker(command, new File("/system/bin/arm64/linker64")) + " " + command;
 
             if (BuildConfig.DEBUG) {
                 Log.d("ProcessHelper", "Executing with output: " + Arrays.toString(splitCommand(command)) + ", " + Arrays.toString(envp) + ", " + workingDir);
@@ -282,6 +282,27 @@ public abstract class ProcessHelper {
         return output.toString().trim();
     }
 
+    /** Optional diagnostic command with a bounded, merged output tail and bounded pipe wait. */
+    public static String execWithBoundedOutput(String command, String[] envp, File workingDir, int timeoutSeconds, int maxChars) {
+        try {
+            if (BuildConfig.MODERN_ANDROID) command = modernLinker(command, new File("/system/bin/arm64/linker64")) + " " + command;
+            ProcessBuilder builder = new ProcessBuilder(splitCommand(command)).redirectErrorStream(true);
+            Map<String, String> env = builder.environment();
+            env.clear();
+            if (envp != null) for (String kv : envp) {
+                int eq = kv.indexOf('=');
+                if (eq > 0) env.put(kv.substring(0, eq), kv.substring(eq + 1));
+            }
+            if (workingDir != null) builder.directory(workingDir);
+            return ProcessOutputCapture.capture(builder.start(), timeoutSeconds, maxChars);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "PROBE_PROCESS interrupted";
+        } catch (Exception e) {
+            return "PROBE_PROCESS failed: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+        }
+    }
+
     public static class ProcessInfo {
         public final int pid;
         public final int ppid;
@@ -304,7 +325,7 @@ public abstract class ProcessHelper {
         int pid = -1;
         java.lang.Process process = null;
         try {
-            if (BuildConfig.MODERN_ANDROID) command = "/system/bin/linker64 " + command;
+            if (BuildConfig.MODERN_ANDROID) command = modernLinker(command, new File("/system/bin/arm64/linker64")) + " " + command;
 
             if (BuildConfig.DEBUG) {
                 Log.d("ProcessHelper", "Executing: " + Arrays.toString(splitCommand(command)) + ", " + Arrays.toString(envp) + ", " + workingDir);
@@ -337,7 +358,7 @@ public abstract class ProcessHelper {
 
     public static java.lang.Process startProcess(String command, String[] envp, File workingDir) {
         try {
-            if (BuildConfig.MODERN_ANDROID) command = "/system/bin/linker64 " + command;
+            if (BuildConfig.MODERN_ANDROID) command = modernLinker(command, new File("/system/bin/arm64/linker64")) + " " + command;
 
             if (BuildConfig.DEBUG) {
                 Log.d("ProcessHelper", "Executing: " + Arrays.toString(splitCommand(command)) + ", " + Arrays.toString(envp) + ", " + workingDir);
@@ -493,6 +514,29 @@ public abstract class ProcessHelper {
         synchronized (debugCallbacks) {
             debugCallbacks.remove(callback);
         }
+    }
+
+    // Google API x86_64 emulator images expose an ARM64 linker through Native Bridge.
+    // Their normal linker is x86_64 and cannot load the app's bundled ARM64 executables.
+    static String modernLinker(String command, File arm64Linker) {
+        if (arm64Linker.isFile()) {
+            String[] args = splitCommand(command);
+            if (args.length > 0) {
+                String executable = args[0];
+                if (executable.startsWith("\"") && executable.endsWith("\""))
+                    executable = executable.substring(1, executable.length() - 1);
+                try (FileInputStream input = new FileInputStream(executable)) {
+                    byte[] header = new byte[20];
+                    if (input.read(header) == header.length && header[0] == 0x7f &&
+                        header[1] == 'E' && header[2] == 'L' && header[3] == 'F' &&
+                        header[4] == 2 && header[5] == 1 && (header[18] & 0xff) == 183 && header[19] == 0)
+                        return arm64Linker.getPath();
+                } catch (IOException ignored) {
+                    // Keep the existing launch error handling for missing or non-ELF commands.
+                }
+            }
+        }
+        return "/system/bin/linker64";
     }
 
     public static String[] splitCommand(String command) {
