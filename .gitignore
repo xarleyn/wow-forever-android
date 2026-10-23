@@ -46,6 +46,20 @@ kls_database.db
 
 # Signing Configs
 *.jks
+*.keystore
+*.p12
+*.pfx
+*.key
+
+# Local secrets and exported client/session state
+.env
+.env.*
+!.env.example
+!.env.sample
+.product.db*
+product.db*
+Battle.net.config
+wow-forever-log-*.txt
 
 # Apple
 .DS_Store
@@ -79,6 +93,8 @@ app/src/main/assets/bundled_components/
 # Blizzard client files never belong in this repo
 WowB-ARM64/
 *.exe
+# Our source-built loader probe is not a Blizzard executable.
+!app/src/main/assets/battlenet/BattleNetProbe.exe
 
 # Agent guidance (private)
 docs/
