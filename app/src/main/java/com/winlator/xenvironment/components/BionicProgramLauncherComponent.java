@@ -21,6 +21,7 @@ import app.gamenative.utils.LsfgVkManager;
 import com.winlator.box86_64.Box86_64Preset;
 import com.winlator.box86_64.Box86_64PresetManager;
 import com.winlator.container.Container;
+import com.winlator.container.ContainerFiles;
 import com.winlator.container.ContainerOverlay;
 import com.winlator.container.Shortcut;
 import com.winlator.contents.ContentProfile;
@@ -30,6 +31,8 @@ import com.winlator.core.DefaultVersion;
 import com.winlator.core.envvars.EnvVarRedaction;
 import com.winlator.core.envvars.EnvVars;
 import com.winlator.core.FileUtils;
+import com.winlator.core.FexRuntimeFiles;
+import com.winlator.core.BattleNetDependencies;
 import com.winlator.core.GPUInformation;
 import com.winlator.core.ProcessHelper;
 import com.winlator.core.SharedComponents;
@@ -46,11 +49,15 @@ import com.winlator.xenvironment.ImageFs;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.RandomAccessFile;
+import java.nio.file.Files;
 import java.net.Inet4Address;
 import java.net.InetAddress;
+import java.security.MessageDigest;
+import java.util.Locale;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -116,6 +123,16 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
             else
                 extractBox64Files();
             if (preUnpack != null) preUnpack.run();
+            if (container != null && "BATTLE_NET".equals(container.getExtra("wowLaunchMode"))) {
+                try {
+                    Log.i("BattleNetCompatibility", app.gamenative.ui.screen.wow.BattleNetCompatibility.prepare(container));
+                } catch (Exception e) {
+                    // Do not log JSON parse messages: those can contain account data.
+                    Log.w("BattleNetCompatibility", "Browser settings preserved; preparation failed: " + e.getClass().getSimpleName());
+                }
+                prepareBattleNetDependencies();
+                logBattleNetModules();
+            }
             pid = execGuestProgram();
             Log.d("BionicProgramLauncherComponent", "Process " + pid + " started");
             PluviaApp.setKeepAlive(true);
@@ -422,6 +439,11 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
             FileUtils.chmod(box64File, 0755);
         }
 
+        if (container != null && "BATTLE_NET".equals(container.getExtra("wowLaunchMode"))) {
+            // Use the fully assembled launch environment, including FEX, preloads, graphics,
+            // certificates and the selected overlay. Shell utility defaults are not equivalent.
+            probeBattleNetLoader(envVars);
+        }
         return ProcessHelper.exec(command, envVars.toStringArray(), workingDir != null ? workingDir : rootDir, (status) -> {
             synchronized (lock) {
                 pid = -1;
@@ -496,19 +518,132 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
             containerDataChanged = true;
         }
 
-        if (!fexcoreVersion.equals(container.getExtra("appliedFexcoreVersion"))) {
-            ContentProfile fexprofile = contentsManager.getProfileByEntryName("fexcore-" + fexcoreVersion);
-            if (fexprofile != null) {
-                contentsManager.applyContent(fexprofile);
-            } else {
-                Log.d("Extraction", "Extracting fexcoreVersion: " + fexcoreVersion);
-                SharedComponents.extractAndLink(environment.getContext(), "fexcore-" + fexcoreVersion, TarCompressorUtils.Type.ZSTD, "fexcore/fexcore-" + fexcoreVersion + ".tzst", system32dir, null);
+        boolean selectedFex = container.getEmulator().equalsIgnoreCase("FEXCore");
+        if (selectedFex && "BATTLE_NET".equals(container.getExtra("wowLaunchMode")) && "2609-0".equals(fexcoreVersion)) {
+            ContentProfile profile = contentsManager.getProfileByEntryName("fexcore-" + fexcoreVersion);
+            if (profile == null) throw new IllegalStateException("FEX 2609 package is missing");
+            try {
+                // A version marker cannot establish integrity: repair both PE and Unix copies.
+                FexRuntimeFiles.install(ContentsManager.getInstallDir(context, profile), system32dir,
+                        new File(environment.getImageFs().getLibDir(), "wine/aarch64-unix"));
+            } catch (IOException e) {
+                throw new IllegalStateException("Couldn't verify or repair FEX 2609 runtime", e);
             }
             container.putExtra("appliedFexcoreVersion", fexcoreVersion);
-            containerDataChanged = true;
+            container.saveData();
+            return;
+        }
+        boolean missingFexDlls = !new File(system32dir, "libwow64fex.dll").isFile() ||
+                !new File(system32dir, "libarm64ecfex.dll").isFile();
+        if (!fexcoreVersion.equals(container.getExtra("appliedFexcoreVersion")) || (selectedFex && missingFexDlls)) {
+            ContentProfile fexprofile = contentsManager.getProfileByEntryName("fexcore-" + fexcoreVersion);
+            boolean applied;
+            if (fexprofile != null) {
+                applied = contentsManager.applyContent(fexprofile);
+            } else {
+                Log.d("Extraction", "Extracting fexcoreVersion: " + fexcoreVersion);
+                applied = SharedComponents.extractAndLink(environment.getContext(), "fexcore-" + fexcoreVersion, TarCompressorUtils.Type.ZSTD, "fexcore/fexcore-" + fexcoreVersion + ".tzst", system32dir, null);
+            }
+            if (applied && new File(system32dir, "libwow64fex.dll").isFile() && new File(system32dir, "libarm64ecfex.dll").isFile()) {
+                container.putExtra("appliedFexcoreVersion", fexcoreVersion);
+                containerDataChanged = true;
+            } else {
+                Log.e("BionicProgramLauncher", "FEX installation is incomplete: " + fexcoreVersion);
+            }
         }
 
         if (containerDataChanged) container.saveData();
+    }
+
+    private void prepareBattleNetDependencies() {
+        File upper = ContainerFiles.upperDir(container);
+        File lower = ContainerFiles.lowerDir(container);
+        List<File> roots = new ArrayList<>();
+        for (String relative : new String[]{"drive_c/Program Files (x86)/Battle.net", "drive_c/Program Files/Battle.net", "drive_c/ProgramData/Battle.net/Agent"}) {
+            File root = ContainerFiles.resolve(container, relative);
+            if (root != null) roots.add(root);
+        }
+        File reportFile = new File(environment.getContext().getExternalFilesDir(null), "wine_logs/battlenet_dependencies.txt");
+        try {
+            String report = BattleNetDependencies.prepare(upper, lower, new File(environment.getImageFs().getWinePath()), roots);
+            if (!reportFile.getParentFile().isDirectory() && !reportFile.getParentFile().mkdirs()) throw new IOException("Couldn't create dependency report directory");
+            Files.write(reportFile.toPath(), report.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            for (String line : report.split("\n")) {
+                if (line.startsWith("SUMMARY") || line.contains("MISSING") || line.contains("INVALID") || line.contains("UNSUPPORTED"))
+                    Log.i("BattleNetDependencies", line);
+            }
+        } catch (IOException e) {
+            // Avoid hiding the actual installer UI because optional diagnostics failed.
+            Log.e("BattleNetDependencies", "Dependency preparation failed: " + e.getMessage());
+            try { Files.write(reportFile.toPath(), ("Dependency preparation failed: " + e.getMessage()).getBytes(java.nio.charset.StandardCharsets.UTF_8)); }
+            catch (IOException ignored) {}
+        }
+    }
+
+    private void logBattleNetModules() {
+        ContentProfile fexProfile = contentsManager.getProfileByEntryName("fexcore-" + container.getFEXCoreVersion());
+        File fexDir = fexProfile == null ? null : ContentsManager.getInstallDir(environment.getContext(), fexProfile);
+        File libDir = environment.getImageFs().getLibDir();
+        Log.i("BattleNetRuntime", "Module inventory after component extraction; container=" + container.id +
+                " fex=" + container.getFEXCoreVersion() + " emulator=" + container.getEmulator());
+        for (String name : new String[]{"libwow64fex.dll", "libarm64ecfex.dll", "wow64win.dll"}) {
+            File installed = ContainerFiles.resolve(container, "drive_c/windows/system32/" + name);
+            Log.i("BattleNetRuntime", "installed " + name + ": " + moduleFingerprint(installed));
+            if (fexDir != null && !name.equals("wow64win.dll"))
+                Log.i("BattleNetRuntime", "package " + name + ": " + moduleFingerprint(new File(fexDir, "system32/" + name)));
+        }
+        for (String name : new String[]{"libwow64fex.so", "libarm64ecfex.so"}) {
+            Log.i("BattleNetRuntime", "unix " + name + ": " + moduleFingerprint(new File(libDir, "wine/aarch64-unix/" + name)));
+            if (fexDir != null)
+                Log.i("BattleNetRuntime", "package " + name + ": " + moduleFingerprint(new File(fexDir, "aarch64-unix/" + name)));
+        }
+    }
+
+    private void probeBattleNetLoader(EnvVars launchEnv) {
+        Context context = environment.getContext();
+        File directory = new File(context.getFilesDir(), "battlenet");
+        File probe = new File(directory, "BattleNetProbe.exe");
+        File result = new File(directory, "battlenet_native_probe.txt");
+        File destination = new File(context.getExternalFilesDir(null), "wine_logs/battlenet_probe_trace.txt");
+        try {
+            Files.createDirectories(destination.getParentFile().toPath());
+            Files.write(destination.toPath(), "PROBE_PROCESS preparing\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            // Never share a previous run's native report as the result of this launch.
+            Files.deleteIfExists(result.toPath());
+            if (!probe.isFile()) throw new IOException("Packaged loader probe is unavailable");
+            EnvVars probeEnv = new EnvVars();
+            probeEnv.putAll(launchEnv);
+            probeEnv.put("WINEDEBUG", "-all,err+all,warn+module,trace+actctx");
+            ImageFs imageFs = environment.getImageFs();
+            String command = getFinalCommand(imageFs.getWinePath() + "/bin", container.getEmulator(), probeEnv,
+                    imageFs.getBinDir(), "wine B:\\BattleNetProbe.exe");
+            String output = ProcessHelper.execWithBoundedOutput(command, probeEnv.toStringArray(),
+                    workingDir != null ? workingDir : imageFs.getRootDir(), 15, 128 * 1024);
+            Files.write(destination.toPath(), output.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            Log.i("BattleNetProbe", result.isFile() ? "Native loader report captured" : "Native loader probe did not produce a report; see probe trace");
+        } catch (Exception e) {
+            Log.w("BattleNetProbe", "Optional loader probe failed; continuing normal launch", e);
+            try { Files.write(destination.toPath(), ("PROBE_PROCESS failed: " + e.getMessage()).getBytes(java.nio.charset.StandardCharsets.UTF_8)); }
+            catch (IOException ignored) {}
+        }
+    }
+
+    // Read only runtime modules, never registry, credentials or launcher session state.
+    private static String moduleFingerprint(File file) {
+        if (file == null || !file.isFile()) return "missing";
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            try (FileInputStream input = new FileInputStream(file)) {
+                byte[] buffer = new byte[64 * 1024];
+                int count;
+                while ((count = input.read(buffer)) != -1) digest.update(buffer, 0, count);
+            }
+            StringBuilder hash = new StringBuilder();
+            for (byte value : digest.digest()) hash.append(String.format(Locale.ROOT, "%02x", value & 0xff));
+            return "bytes=" + file.length() + " sha256=" + hash + " path=" + file.getPath();
+        } catch (Exception e) {
+            return "bytes=" + file.length() + " unreadable=" + e.getClass().getSimpleName();
+        }
     }
 
     private void addBox64EnvVars(EnvVars envVars, boolean enableLogs) {

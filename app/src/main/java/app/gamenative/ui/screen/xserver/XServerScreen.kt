@@ -1005,7 +1005,7 @@ fun XServerScreen(
         controllerSlotStatusVersion++
         xServerView?.getxServer()?.winHandler?.refreshControllerMappingsForHotplug()
 
-        if (!usingScreenMirror &&
+        if (container.getExtra("wowLaunchMode") != "BATTLE_NET" && !usingScreenMirror &&
             !hasInternalTouchpad && !hasPhysicalMouse && !hasPhysicalKeyboard && !hasPhysicalController &&
             !container.isTouchscreenMode) {
             val manager = PluviaApp.inputControlsManager
@@ -2503,6 +2503,7 @@ fun XServerScreen(
                         // 3. Else if physical mouse/keyboard detected → hide
                         // 4. Else → show
                         val shouldShowControls = when {
+                            container.getExtra("wowLaunchMode") == "BATTLE_NET" -> false
                             container.isTouchscreenMode -> false
                             hasPhysicalController -> false
                             hasPhysicalKeyboard || hasPhysicalMouse -> false
@@ -2587,6 +2588,18 @@ fun XServerScreen(
         // Click highlight overlay (gesture overhaul)
         if (currentGestureConfig.showClickHighlight && clickHighlightPoints.isNotEmpty()) {
             app.gamenative.ui.component.ClickHighlightOverlay(points = clickHighlightPoints)
+        }
+
+        if (container.getExtra("wowLaunchMode") == "BATTLE_NET" && !showQuickMenu && !isEditMode) {
+            app.gamenative.ui.screen.wow.BattleNetToolbar(
+                modifier = Modifier.align(Alignment.TopEnd).statusBarsPadding().padding(8.dp),
+                controlsVisible = areControlsVisible,
+                onKeyboard = {
+                    forceResumeIfSuspended()
+                    showSoftKeyboard(view, "battlenet_keyboard")
+                },
+                onControls = { onQuickMenuItemSelected(QuickMenuAction.INPUT_CONTROLS) },
+            )
         }
 
         // Debug gesture name overlay (gesture overhaul)
@@ -3605,17 +3618,36 @@ private fun setupXEnvironment(
     )
     // capture debug output to file if either Wine or Box86/64 logging is enabled
     var logFile: File? = null
-    val captureLogs = enableWineDebug || enableBox86Logs
+    var errorLogFile: File? = null
+    val diagnosticLogLock = Any()
+    val battleNetMode = container.getExtra("wowLaunchMode") == "BATTLE_NET"
+    val captureLogs = enableWineDebug || enableBox86Logs || battleNetMode
+    // module warnings include the failed DLL's name; load_64bit_module alone only prints status.
+    if (battleNetMode && !enableWineDebug) envVars.put("WINEDEBUG", "-all,err+all,warn+module,trace+loaddll")
     if (captureLogs) {
         val wineLogDir = File(context.getExternalFilesDir(null), "wine_logs")
         wineLogDir.mkdirs()
-        logFile = File(wineLogDir, "wine_debug.log")
+        logFile = File(wineLogDir, if (battleNetMode) "battlenet_runtime.log" else "wine_debug.log")
         if (logFile.exists()) logFile.delete()
+        if (battleNetMode) {
+            errorLogFile = File(wineLogDir, "battlenet_errors.log")
+            errorLogFile?.writeText("")
+        }
     }
 
     ProcessHelper.addDebugCallback { line ->
         if (captureLogs) {
-            logFile?.appendText(line + "\n")
+            val text = if (battleNetMode) app.gamenative.ui.screen.wow.WoWConnectionDiagnostics.sanitize(line) else line
+            synchronized(diagnosticLogLock) {
+                logFile?.let { file ->
+                    if (battleNetMode && file.length() >= 512 * 1024) file.writeText(file.readText().takeLast(256 * 1024))
+                    file.appendText(text + "\n")
+                }
+                if (":err:" in text || "Failed to load module" in text) errorLogFile?.let { file ->
+                    if (file.length() >= 256 * 1024) file.writeText(file.readText().takeLast(128 * 1024))
+                    file.appendText(text + "\n")
+                }
+            }
         }
     }
 
@@ -3835,6 +3867,11 @@ private fun getWineStartCommand(
     FileUtils.clear(tempDir)
 
     val executablePath = container.executablePath
+    // Wine's ARM64EC loader handles the official launcher's PE architecture. Launch it directly
+    // rather than nesting the x64 winhandler helper; the launcher owns the subsequent game launch.
+    if (container.getExtra("wowLaunchMode") == "BATTLE_NET" && executablePath.isNotEmpty()) {
+        return app.gamenative.ui.screen.wow.BattleNetLauncher.commandArgument(executablePath)
+    }
     if (executablePath.isEmpty()) {
         return "winhandler.exe \"wfm.exe\""
     }

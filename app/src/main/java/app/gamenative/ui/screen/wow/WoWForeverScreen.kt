@@ -97,6 +97,9 @@ fun WoWForeverScreen(
     var accounts by remember { mutableStateOf(initialAccounts.getOrNull()?.first.orEmpty()) }
     var activeAccount by remember { mutableStateOf(initialAccounts.getOrNull()?.second) }
     val hasSavedLogin = activeAccount?.region != null
+    var launchMode by remember { mutableStateOf(BattleNetLauncher.loadMode(context)) }
+    var battleNetGameFiles by remember { mutableStateOf(BattleNetLauncher.useGameFiles(context)) }
+    val needsGameFiles = launchMode == WoWLaunchMode.DIRECT || battleNetGameFiles
     var isManagingAccount by remember { mutableStateOf(false) }
     var editingAccount by remember { mutableStateOf<BattleNetAccount?>(null) }
     var editingLogin by remember { mutableStateOf<BattleNetSignIn.Login?>(null) }
@@ -186,7 +189,30 @@ fun WoWForeverScreen(
                 val root = File(gamePath)
                 WoWConnectionDiagnostics.read(root, WowClientDownloader.profileForGameRoot(root))
             }
-            logsText = connection + "\n\n=== App log ===\n" +
+            val battleNetLog = withContext(Dispatchers.IO) {
+                runCatching {
+                    val file = File(context.getExternalFilesDir(null), "wine_logs/battlenet_runtime.log")
+                    val dependencies = File(context.getExternalFilesDir(null), "wine_logs/battlenet_dependencies.txt")
+                    val errorLog = File(context.getExternalFilesDir(null), "wine_logs/battlenet_errors.log")
+                    val probe = File(BattleNetLauncher.toolsDirectory(context), "battlenet_native_probe.txt")
+                    val probeTrace = File(context.getExternalFilesDir(null), "wine_logs/battlenet_probe_trace.txt")
+                    val native = (if (probe.isFile) "\n\n=== Native Wine loader probe ===\n" + probe.readText().take(32 * 1024) else "") +
+                        (if (probeTrace.isFile) "\n\n=== Native Wine activation-context trace ===\n" + probeTrace.readText().takeLast(128 * 1024) else "")
+                    val inventory = if (dependencies.isFile) "\n\n=== Battle.net dependency inventory ===\n" + dependencies.readText().takeLast(256 * 1024) else ""
+                    val runtime = if (file.isFile) {
+                        val text = file.readText()
+                        val failures = (if (errorLog.isFile) errorLog.readText() else text).lineSequence().filter { ":err:" in it || "Failed to load module" in it }
+                            .distinct().take(200).joinToString("\n")
+                        "\n\n=== Battle.net loader errors ===\n$failures\n\n=== Battle.net runtime tail ===\n" + text.takeLast(64 * 1024)
+                    } else ""
+                    val client = runCatching {
+                        ContainerManager(context).getContainerById(BattleNetLauncher.CONTAINER_ID)
+                            ?.let { "\n\n" + BattleNetCompatibility.diagnostics(it) }.orEmpty()
+                    }.getOrDefault("\nBattle.net browser/session diagnostics unavailable")
+                    WoWConnectionDiagnostics.sanitize(inventory + native + runtime + client)
+                }.getOrDefault("")
+            }
+            logsText = connection + battleNetLog + "\n\n=== App log ===\n" +
                 WoWConnectionDiagnostics.sanitize(listOf(buffer, logcat).filter { it.isNotBlank() }.joinToString("\n"))
             isLogsLoading = false
         }
@@ -294,7 +320,7 @@ fun WoWForeverScreen(
 
     fun checkFiles(): Boolean {
         files = GamePath.status(context, gamePath)
-        if (files.isWrongGame) {
+        if (files.isWrongGame && needsGameFiles) {
             errorMessage = "Incompatible game (${files.product}). WoW Forever supports ${WoWProducts.supported.map { it.displayName }.joinToString(" or ")}."
         }
         return files.isReady
@@ -313,17 +339,18 @@ fun WoWForeverScreen(
     }
 
     fun launchGame() {
-        if (isLaunching || isManagingAccount || files.isWrongGame) return
-        if (!files.hasStorageAccess) {
+        if (isLaunching || isManagingAccount || (needsGameFiles && files.isWrongGame)) return
+        if (needsGameFiles && !files.hasStorageAccess) {
             showStoragePermissionDialog = true
             return
         }
-        if (activeAccount?.region == null) {
+        if (launchMode == WoWLaunchMode.DIRECT && activeAccount?.region == null) {
             errorMessage = "Choose an account and confirm its WoW region before playing."
             openAccountDialog(activeAccount)
             return
         }
-        val launchAccount = activeAccount!!
+        val launchAccount = activeAccount
+        val selectedMode = launchMode
         isLaunching = true
         errorMessage = null
         statusText = "Preparing components..."
@@ -332,20 +359,22 @@ fun WoWForeverScreen(
             try {
                 val screenSize = fitScreenSizeToWindow(context, gpu.screenSize)
                 val containerId = withContext(Dispatchers.IO) {
-                    prepareLaunch(context, File(gamePath), gpu, screenSize, launchAccount) { msg ->
+                    prepareLaunch(context, File(gamePath), gpu, screenSize, launchAccount, selectedMode) { msg ->
                         scope.launch(Dispatchers.Main) { statusText = msg }
                     }
                 }
-                statusText = "Booting into World of Warcraft..."
+                statusText = if (selectedMode == WoWLaunchMode.BATTLE_NET) "Opening official Battle.net..." else "Booting into World of Warcraft..."
                 onLaunch(containerId)
             } catch (e: CancellationException) {
                 throw e
             } catch (_: StorageAccessDeniedException) {
+                PluviaApp.events.emit(AndroidEvent.ClearBootingSplash)
                 isLaunching = false
                 statusText = READY_STATUS
                 denyStorageAccess()
             } catch (e: Exception) {
                 Timber.e(e, "Error launching WoW Forever")
+                PluviaApp.events.emit(AndroidEvent.ClearBootingSplash)
                 errorMessage = e.message ?: "Launch failed"
                 statusText = "Launch failed"
                 isLaunching = false
@@ -406,8 +435,8 @@ fun WoWForeverScreen(
         }
     }
 
-    val filesMissing = !(files.dataExists && files.buildInfoExists)
-    val canPlay = !isLaunching && !isUpdating && !isManagingAccount && !filesMissing && !files.isWrongGame
+    val filesMissing = needsGameFiles && !(files.dataExists && files.buildInfoExists)
+    val canPlay = !isLaunching && !isUpdating && !isManagingAccount && !filesMissing && !(needsGameFiles && files.isWrongGame)
 
     fun performUpdate() {
         val target = versionStatus ?: return
@@ -440,13 +469,13 @@ fun WoWForeverScreen(
     }
 
     LaunchedEffect(gamePath) {
-        val ready = checkFiles()
+        val ready = checkFiles() || !needsGameFiles
         if (!files.hasStorageAccess && (files.dataExists || files.buildInfoExists)) {
             showStoragePermissionDialog = true
         }
         Timber.i("WoWForeverScreen LaunchedEffect: gamePath=$gamePath, ready=$ready, hasSavedLogin=$hasSavedLogin, shouldAutoLaunch=${WoWLauncherState.shouldAutoLaunch}")
         when {
-            !ready || !hasSavedLogin -> {
+            !ready || (launchMode == WoWLaunchMode.DIRECT && !hasSavedLogin) -> {
                 WoWLauncherState.shouldAutoLaunch = false
                 PluviaApp.events.emit(AndroidEvent.ClearBootingSplash)
                 if (ready) {
@@ -464,7 +493,7 @@ fun WoWForeverScreen(
                 val update = updateJob.await()
                 Timber.i("WoWForeverScreen LaunchedEffect: isOutdated=${versionStatus?.isOutdated}, appUpdate=$update")
                 WoWLauncherState.shouldAutoLaunch = false
-                if (versionStatus?.isOutdated == true || update != null) {
+                if ((versionStatus?.isOutdated == true && launchMode == WoWLaunchMode.DIRECT) || update != null) {
                     PluviaApp.events.emit(AndroidEvent.ClearBootingSplash)
                 } else {
                     launchGame()
@@ -525,7 +554,53 @@ fun WoWForeverScreen(
                     .verticalScroll(rememberScrollState()),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-            BattleNetAccountCard(
+            Card(
+                modifier = Modifier.fillMaxWidth(0.9f),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF131D2E), contentColor = Color(0xFFE2E8F0)),
+            ) {
+                Column(Modifier.padding(16.dp)) {
+                    SectionTitle("LAUNCH WITH", WowGold)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        WoWLaunchMode.entries.forEach { mode ->
+                            FilterChip(
+                                selected = launchMode == mode,
+                                enabled = !isLaunching && !isUpdating && !isManagingAccount,
+                                onClick = {
+                                    try {
+                                        BattleNetLauncher.saveMode(context, mode)
+                                        launchMode = mode
+                                    } catch (_: Exception) {
+                                        errorMessage = "Couldn't save launch mode."
+                                    }
+                                },
+                                label = { Text(if (mode == WoWLaunchMode.BATTLE_NET) "Battle.net" else "Direct") },
+                            )
+                        }
+                    }
+                    Text(if (launchMode == WoWLaunchMode.BATTLE_NET)
+                        "Experimental: install and sign in to the official Battle.net app first. Enable existing game files below after login succeeds."
+                    else "Launch WoW directly with your saved login profile.")
+                    if (launchMode == WoWLaunchMode.BATTLE_NET) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(checked = battleNetGameFiles,
+                                enabled = !isLaunching && !isUpdating,
+                                onCheckedChange = { enabled ->
+                                    try {
+                                        BattleNetLauncher.useGameFiles(context, enabled)
+                                        battleNetGameFiles = enabled
+                                    } catch (_: Exception) {
+                                        errorMessage = "Couldn't save game access preference."
+                                    }
+                                })
+                            Text("Connect existing WoW files")
+                        }
+                        Text(if (battleNetGameFiles) "Use Locate Game and select G:\\. Battle.net may update these files."
+                            else "Battle.net uses a separate environment. WoW files are not connected.", color = WowMuted)
+                    }
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+            if (launchMode == WoWLaunchMode.DIRECT) BattleNetAccountCard(
                 accounts = accounts,
                 active = activeAccount,
                 enabled = !isLaunching && !isUpdating && !isManagingAccount,
@@ -554,6 +629,7 @@ fun WoWForeverScreen(
                     Spacer(modifier = Modifier.height(14.dp))
 
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (needsGameFiles) {
                         CheckItem(label = if (files.exeExists) "ARM64 Binary (${WowClientDownloader.profileForGameRoot(File(gamePath)).executableName})" else "ARM64 Binary (downloads on Play)", ready = files.exeExists)
                         CheckItem(label = "Game Asset Archives (Data/)", ready = files.dataExists)
                         CheckItem(
@@ -561,9 +637,10 @@ fun WoWForeverScreen(
                             ready = files.buildInfoExists && !files.isWrongGame
                         )
                         CheckItem(label = "All Files Access Permission", ready = files.hasStorageAccess)
+                        }
                         CheckItem(
-                            label = if (hasSavedLogin) "Battle.net Login (Configured)" else "Battle.net Login (select account and region above)",
-                            ready = hasSavedLogin,
+                            label = if (launchMode == WoWLaunchMode.BATTLE_NET) "Official login opens in Battle.net" else if (hasSavedLogin) "Battle.net Login (Configured)" else "Battle.net Login (select account and region above)",
+                            ready = launchMode == WoWLaunchMode.BATTLE_NET || hasSavedLogin,
                         )
                         appUpdate?.let {
                             CheckItem(
@@ -760,7 +837,7 @@ fun WoWForeverScreen(
                     }
 
                     when {
-                        versionStatus?.isOutdated == true -> {
+                        versionStatus?.isOutdated == true && launchMode == WoWLaunchMode.DIRECT -> {
                             PrimaryButton(
                                 text = "UPDATE TO ${versionStatus?.remoteVersion}",
                                 icon = Icons.Default.Refresh,
@@ -777,14 +854,14 @@ fun WoWForeverScreen(
                                 Text(text = "LAUNCH ANYWAY (OUTDATED)", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = WowError)
                             }
                         }
-                        !files.hasStorageAccess -> PrimaryButton(
+                        needsGameFiles && !files.hasStorageAccess -> PrimaryButton(
                             text = "GRANT STORAGE PERMISSION",
                             icon = Icons.Default.FolderOpen,
                             enabled = !isLaunching && !isUpdating,
                             onClick = { StorageUtils.requestManageExternalStoragePermission(context) },
                         )
                         else -> PrimaryButton(
-                            text = if (files.isWrongGame) "SUPPORTED CLIENT REQUIRED" else "PLAY WORLD OF WARCRAFT",
+                            text = if (needsGameFiles && files.isWrongGame) "SUPPORTED CLIENT REQUIRED" else if (launchMode == WoWLaunchMode.BATTLE_NET) "OPEN BATTLE.NET" else "PLAY WORLD OF WARCRAFT",
                             icon = Icons.Default.PlayArrow,
                             enabled = canPlay,
                             onClick = ::launchGame,
@@ -1099,9 +1176,11 @@ private const val ADRENO_8XX_DRIVER = "Turnip-V32-RP6sched"
 private const val PROTON_VERSION = "proton-11.0-90624-arm64ec"
 private const val DXVK_VERSION = "2.4.1-wow-aarch64-test"
 
-private data class GpuProfile(val driver: String, val tuDebug: String, val screenSize: String, val label: String, val edition: String) {
+private data class GpuProfile(val driver: String, val tuDebug: String, val screenSize: String, val label: String, val edition: String, val displayRenderer: String = "vulkan") {
     companion object {
-        fun detect(context: Context) = if (isAdreno8xxDevice(context)) {
+        fun detect(context: Context) = if (Build.HARDWARE == "ranchu" || Build.HARDWARE == "goldfish") {
+            GpuProfile("System", "", "1280x720", "Android Emulator", "Android Emulator / system graphics", "gl")
+        } else if (isAdreno8xxDevice(context)) {
             GpuProfile(ADRENO_8XX_DRIVER, "noconform,sysmem", "1280x720", "Adreno 8xx", "Snapdragon 8 Elite / Adreno 8xx")
         } else {
             GpuProfile(DEFAULT_DRIVER, "noconform", "1920x1080", "Adreno 740", "Snapdragon 8 Series / Adreno 740")
@@ -1141,21 +1220,26 @@ internal fun fitScreenSize(baseSize: String, windowWidth: Int, windowHeight: Int
     return "${(width / 2).roundToInt() * 2}x${(height / 2).roundToInt() * 2}"
 }
 
-private fun prepareLaunch(context: Context, gameRoot: File, gpu: GpuProfile, screenSize: String, account: BattleNetAccount, onStatus: (String) -> Unit): String {
-    val login = BattleNetSignIn.store(context).login(account.id)
+private fun prepareLaunch(context: Context, gameRoot: File, gpu: GpuProfile, screenSize: String, account: BattleNetAccount?, mode: WoWLaunchMode, onStatus: (String) -> Unit): String {
+    val login = if (mode == WoWLaunchMode.DIRECT) BattleNetSignIn.store(context).login(requireNotNull(account).id) else null
     installBundledComponents(context, onStatus)
+    if (mode == WoWLaunchMode.BATTLE_NET) BattleNetLauncher.ensureEmulator(context, onStatus)
 
-    check(File(gameRoot, BUILD_INFO).exists()) { "Missing $BUILD_INFO in $gameRoot. Copy it from your WoW install." }
+    if (mode == WoWLaunchMode.DIRECT || BattleNetLauncher.useGameFiles(context)) {
+        check(File(gameRoot, BUILD_INFO).exists()) { "Missing $BUILD_INFO in $gameRoot. Copy it from your WoW install." }
+    }
     val profile = WowClientDownloader.profileForGameRoot(gameRoot)
     try {
-        ensureGameConfig(gameRoot, screenSize, profile, account.region)
+        if (mode == WoWLaunchMode.DIRECT) {
+            ensureGameConfig(gameRoot, screenSize, profile, account?.region)
+        }
     } catch (e: Exception) {
         if (e.isPermissionDenied()) throw StorageAccessDeniedException(e)
         throw e
     }
 
     var arm64Exe = WowClientDownloader.resolveExecutable(gameRoot, profile)
-    if (arm64Exe == null) {
+    if (arm64Exe == null && mode == WoWLaunchMode.DIRECT) {
         try {
             WowClientDownloader.download(gameRoot, onStatus)
         } catch (e: Exception) {
@@ -1169,47 +1253,57 @@ private fun prepareLaunch(context: Context, gameRoot: File, gpu: GpuProfile, scr
 
     onStatus("Configuring ${gpu.label} container...")
     val containerManager = ContainerManager(context)
-    val config = containerConfig(gameRoot, gpu, screenSize)
-    val container = containerManager.getContainerById(CONTAINER_ID)
+    val containerId = if (mode == WoWLaunchMode.BATTLE_NET) BattleNetLauncher.CONTAINER_ID else CONTAINER_ID
+    val container = containerManager.getContainerById(containerId)
+    val battleNetTarget = if (mode == WoWLaunchMode.BATTLE_NET) BattleNetLauncher.prepare(context, container, onStatus) else null
+    val config = containerConfig(context, gameRoot, gpu, screenSize, battleNetTarget)
     if (container == null) {
         onStatus("Creating prefix environment (first boot)...")
-        containerManager.createContainer(CONTAINER_ID, config)
+        containerManager.createContainer(containerId, config)
     } else {
         container.loadData(config)
         container.saveData()
     }
-    check(containerManager.hasContainer(CONTAINER_ID)) { "Container creation failed. Check system storage and logs." }
+    check(containerManager.hasContainer(containerId)) { "Container creation failed. Check system storage and logs." }
     // Write credentials only when downloads and prefix creation have succeeded.
     check(BattleNetSignIn.removeLoginFile(gameRoot)) { "Couldn't remove previous game login" }
-    BattleNetSignIn.writeLoginFile(gameRoot, login)
-    BattleNetSignIn.startLoginWatcher(gameRoot)
-    return CONTAINER_ID
+    val configuredContainer = requireNotNull(containerManager.getContainerById(containerId))
+    configuredContainer.putExtra("wowLaunchMode", mode.name)
+    configuredContainer.saveData()
+    if (login != null) {
+        BattleNetSignIn.writeLoginFile(gameRoot, login)
+        BattleNetSignIn.startLoginWatcher(gameRoot)
+    }
+    return containerId
 }
 
-private fun containerConfig(gameRoot: File, gpu: GpuProfile, screenSize: String): JSONObject {
+private fun containerConfig(context: Context, gameRoot: File, gpu: GpuProfile, screenSize: String, battleNetTarget: BattleNetLaunchTarget?): JSONObject {
     val profile = WowClientDownloader.profileForGameRoot(gameRoot)
     val exeName = WowClientDownloader.resolveExecutable(gameRoot, profile)?.name ?: profile.executableName
     val samsungEnv = if (Build.MANUFACTURER.equals("samsung", ignoreCase = true)) " FD_DEV_FEATURES=enable_tp_ubwc_flag_hint=1" else ""
     val envVars = "WRAPPER_MAX_IMAGE_COUNT=0 ZINK_DESCRIPTORS=lazy ZINK_DEBUG=compact,deck_emu MESA_SHADER_CACHE_DISABLE=false MESA_SHADER_CACHE_MAX_SIZE=512MB mesa_glthread=true WINEESYNC=0 MESA_VK_WSI_PRESENT_MODE=mailbox TU_DEBUG=${gpu.tuDebug} VKD3D_SHADER_MODEL=6_0 PULSE_LATENCY_MSEC=144$samsungEnv"
     return JSONObject().apply {
-        put("id", CONTAINER_ID)
-        put("name", "WoW Forever")
+        put("id", if (battleNetTarget != null) BattleNetLauncher.CONTAINER_ID else CONTAINER_ID)
+        put("name", if (battleNetTarget != null) "Battle.net" else "WoW Forever")
         put("screenSize", screenSize)
         put("envVars", envVars)
         put("graphicsDriver", "Wrapper")
         put("graphicsDriverVersion", gpu.driver)
-        put("graphicsDriverConfig", "version=${gpu.driver},adrenotoolsTurnip=1,resourceType=buffer,bcnEmulation=auto,quality=high")
-        put("displayRenderer", "vulkan")
+        put("graphicsDriverConfig", "version=${gpu.driver},adrenotoolsTurnip=${if (gpu.driver == "System") 0 else 1},resourceType=buffer,bcnEmulation=auto,quality=high")
+        put("displayRenderer", gpu.displayRenderer)
         put("dxwrapper", "dxvk-$DXVK_VERSION-1")
         put("dxwrapperConfig", "version=$DXVK_VERSION-1")
         put("wineVersion", "$PROTON_VERSION-1")
         put("containerVariant", "bionic")
-        put("fexcoreVersion", "2609-0")
-        put("drives", "D:/storage/emulated/0/DownloadE:/data/data/app.wowforever/storageG:${gameRoot.path}")
-        put("executablePath", "G:\\${profile.flavorDir}\\$exeName")
-        put("execArgs", "-d3d11")
+        put("fexcoreVersion", "${BattleNetLauncher.FEX_VERSION}-0")
+        put("drives", if (battleNetTarget != null)
+            "B:${BattleNetLauncher.toolsDirectory(context).path}" +
+                (if (BattleNetLauncher.useGameFiles(context)) "G:${gameRoot.path}" else "")
+            else "D:/storage/emulated/0/DownloadE:/data/data/app.wowforever/storageG:${gameRoot.path}")
+        put("executablePath", battleNetTarget?.executable ?: "G:\\${profile.flavorDir}\\$exeName")
+        put("execArgs", if (battleNetTarget != null) "" else "-d3d11")
         put("showFPS", true)
-        put("startupSelection", Container.STARTUP_SELECTION_AGGRESSIVE.toInt())
+        put("startupSelection", (if (battleNetTarget != null) Container.STARTUP_SELECTION_NORMAL else Container.STARTUP_SELECTION_AGGRESSIVE).toInt())
         put("wow64Mode", true)
         put("wincomponents", "direct3d=0,directsound=0,directinput8=0,directinput=0,directmusic=0,directshow=0,directplay=0,vcrun2010=0,wmdecoder=0,opengl=0")
     }
