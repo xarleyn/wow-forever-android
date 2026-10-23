@@ -119,6 +119,8 @@ fun WoWForeverScreen(
     var logsText by remember { mutableStateOf("") }
     var isLogsLoading by remember { mutableStateOf(false) }
     var logsCopied by remember { mutableStateOf(false) }
+    var isSharingLogs by remember { mutableStateOf(false) }
+    var logShareError by remember { mutableStateOf<String?>(null) }
 
 
     fun refreshAccounts() {
@@ -210,16 +212,25 @@ fun WoWForeverScreen(
     }
 
     fun shareLogs() {
-        if (logsText.isBlank()) return
-        val intent = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_SUBJECT, "WoW Forever logs")
-            putExtra(Intent.EXTRA_TEXT, logsText)
+        if (logsText.isBlank() || isSharingLogs) return
+        val snapshot = logsText
+        isSharingLogs = true
+        logShareError = null
+        scope.launch {
+            try {
+                val intent = withContext(Dispatchers.IO) { WoWLogShare.createIntent(context, snapshot) }
+                val chooser = Intent.createChooser(intent, "Share logs").apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(chooser)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                logShareError = "Couldn't share logs. Check free storage and try again."
+            } finally {
+                isSharingLogs = false
+            }
         }
-        val chooser = Intent.createChooser(intent, "Share logs").apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        runCatching { context.startActivity(chooser) }
     }
 
     suspend fun fetchAppUpdate(): AppUpdater.Release? {
@@ -682,10 +693,13 @@ fun WoWForeverScreen(
                             TextButton(onClick = { copyLogs() }) {
                                 Text(if (logsCopied) "Copied" else "Copy", color = WowGold)
                             }
-                            TextButton(onClick = { shareLogs() }) { Text("Share", color = WowGold) }
+                            TextButton(onClick = { shareLogs() }, enabled = !isSharingLogs && logsText.isNotBlank()) {
+                                Text(if (isSharingLogs) "Preparing…" else "Share", color = WowGold)
+                            }
                         }
                     }
                     Spacer(Modifier.height(8.dp))
+                    logShareError?.let { Text(it, color = WowError, fontSize = 12.sp) }
                     if (isLogsLoading) {
                         CircularProgressIndicator(color = WowGold, modifier = Modifier.size(24.dp))
                     } else {
