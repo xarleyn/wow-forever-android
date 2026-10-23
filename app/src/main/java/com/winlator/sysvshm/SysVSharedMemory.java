@@ -80,13 +80,17 @@ public class SysVSharedMemory {
     }
 
     public void delete(int shmid) {
-        SHMemory shmemory = shmemories.get(shmid);
-        if (shmemory != null) {
-            if (SHMemory.access$000(shmemory) != -1) {
-                XConnectorEpoll.closeFd(SHMemory.access$000(shmemory));
-                SHMemory.access$002(shmemory, -1);
+        // SparseArray.remove writes a tombstone that valueAt must never observe.
+        // The SysV connector can delete while the X11 connector detaches a buffer.
+        synchronized (shmemories) {
+            SHMemory shmemory = shmemories.get(shmid);
+            if (shmemory != null) {
+                if (SHMemory.access$000(shmemory) != -1) {
+                    XConnectorEpoll.closeFd(SHMemory.access$000(shmemory));
+                    SHMemory.access$002(shmemory, -1);
+                }
+                shmemories.remove(shmid);
             }
-            shmemories.remove(shmid);
         }
     }
 
